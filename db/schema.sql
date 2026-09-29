@@ -1,14 +1,12 @@
 -- YouthLink Prototype Database Schema
 -- PostgreSQL + pgvector
 --
--- Prerequisite:
---   CREATE EXTENSION IF NOT EXISTS vector;
---   CREATE EXTENSION IF NOT EXISTS pgcrypto;
+-- Embedding model:
+--   text-embedding-3-small
+--   dimension: 1536
+--   distance: cosine
 --
--- Note:
---   POLICY_CHUNK.embedding is declared as `vector` without a fixed dimension
---   so the prototype is not tied to one embedding model yet.
---   After choosing a model, you can migrate it to vector(N) and add an HNSW index.
+-- Run db/extensions.sql before this file.
 
 BEGIN;
 
@@ -24,7 +22,6 @@ CREATE INDEX IF NOT EXISTS idx_common_code_group
 CREATE TABLE IF NOT EXISTS policy (
     policy_no                       VARCHAR(30) PRIMARY KEY,
     policy_name                     VARCHAR(300) NOT NULL,
-
     description                     TEXT,
     support_content                 TEXT,
 
@@ -90,18 +87,10 @@ CREATE TABLE IF NOT EXISTS policy (
     raw_data                        JSONB NOT NULL DEFAULT '{}'::jsonb,
 
     CONSTRAINT chk_policy_age_range
-        CHECK (
-            min_age IS NULL
-            OR max_age IS NULL
-            OR min_age <= max_age
-        ),
+        CHECK (min_age IS NULL OR max_age IS NULL OR min_age <= max_age),
 
     CONSTRAINT chk_policy_income_range
-        CHECK (
-            min_income IS NULL
-            OR max_income IS NULL
-            OR min_income <= max_income
-        ),
+        CHECK (min_income IS NULL OR max_income IS NULL OR min_income <= max_income),
 
     CONSTRAINT chk_policy_application_period
         CHECK (
@@ -189,7 +178,7 @@ CREATE TABLE IF NOT EXISTS policy_chunk (
     content             TEXT NOT NULL,
 
     embedding           VECTOR(1536),
-    embedding_model     VARCHAR(100),
+    embedding_model     VARCHAR(100) NOT NULL DEFAULT 'text-embedding-3-small',
 
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
@@ -211,16 +200,10 @@ CREATE INDEX IF NOT EXISTS idx_policy_chunk_policy_no
 CREATE INDEX IF NOT EXISTS idx_policy_chunk_type
     ON policy_chunk (chunk_type);
 
--- After fixing the embedding dimension, add an HNSW index.
--- Example for a 1536-dimensional embedding model:
---
--- ALTER TABLE policy_chunk
---     ALTER COLUMN embedding TYPE vector(1536)
---     USING embedding::vector(1536);
---
--- CREATE INDEX idx_policy_chunk_embedding_hnsw
---     ON policy_chunk
---     USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_policy_chunk_embedding_hnsw
+    ON policy_chunk
+    USING hnsw (embedding vector_cosine_ops)
+    WHERE embedding IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS chat_room (
     room_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -306,9 +289,5 @@ CREATE TABLE IF NOT EXISTS message_policy_ref (
 
 CREATE INDEX IF NOT EXISTS idx_message_policy_ref_policy
     ON message_policy_ref (policy_no);
-
-CREATE INDEX idx_policy_chunk_embedding_hnsw
-    ON policy_chunk
-    USING hnsw (embedding vector_cosine_ops);
 
 COMMIT;
