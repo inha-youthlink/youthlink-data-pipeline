@@ -2,9 +2,9 @@
 
 온통청년 API의 청년 지원 정책을 수집·정제하여 PostgreSQL에 저장하는 YouthLink의 데이터 파이프라인입니다. 정책 검색과 맞춤형 추천에 필요한 데이터를 준비하고, 이후 pgvector 기반 RAG와 챗봇으로 연결하는 것을 목표로 합니다.
 
-현재 ETL은 `policy`, `policy_region`, `policy_eligibility_code` 3개 테이블을 적재합니다. `common_code`는 SQL seed로 채우며, 임베딩과 채팅 관련 테이블은 스키마가 준비된 단계입니다.
+정책 ETL은 `policy`, `policy_region`, `policy_eligibility_code` 3개 테이블을 적재합니다. 지역 ETL은 VWorld의 시도·시군구 정보를 `region`에 동기화하며, `region_code_mapping`과 `v_policy_region_resolved`를 통해 온통청년의 과거·상위 지역 코드까지 현재 코드로 해석합니다. `common_code`는 SQL seed로 채우며, 임베딩과 채팅 관련 테이블은 스키마가 준비된 단계입니다.
 
-> 작성 기준: 2026-09-30에 확인한 저장소 코드. 아래의 구현 현황은 코드 기준이며, 실제 API 전체 수집 성공이나 운영 DB 상태를 보증하는 실행 결과는 아닙니다. 샘플 실행 전에는 6절의 CLI 분기 수정 사항을 확인하세요.
+> 작성 기준: 2026-10-04에 정리한 프로젝트 구현 상태. 아래의 구현 현황은 코드 기준이며, 실제 API 전체 수집 성공이나 운영 DB 상태를 보증하는 실행 결과는 아닙니다. 샘플 실행 전에는 6절의 CLI 분기 수정 사항을 확인하세요.
 
 ## 1. 처음 참여한 팀원의 진행 순서
 
@@ -24,12 +24,15 @@ youthlink-data-pipeline/
 ├── db/
 │   ├── extensions.sql          # vector, pgcrypto 확장 활성화
 │   ├── schema.sql              # 9개 테이블·제약조건·인덱스
+│   ├── migrations/             # region 테이블·매핑·조회 View 마이그레이션
 │   └── seed/
-│       └── common_code.sql     # API 코드 → 이름 매핑
+│       ├── common_code.sql     # API 코드 → 이름 매핑
+│       └── region_code_mapping.sql # 과거·분할·상위 지역 코드 매핑
 ├── docs/
 │   └── erd.md                  # 전체 테이블 관계도
 ├── etl/
 │   ├── load_policies.py        # API/JSON 추출·변환·적재
+│   ├── load_regions.py         # VWorld 시도·시군구 동기화 및 검증
 │   └── logs/                  # 실행 중 생성, Git 제외
 │       └── failed_policies.jsonl
 ├── sample_response.json       # 로컬 적재 테스트용 응답
@@ -43,7 +46,7 @@ youthlink-data-pipeline/
 
 스키마의 기준은 [db/schema.sql](db/schema.sql), 상세 관계도는 [docs/erd.md](docs/erd.md), 변환·저장 동작의 기준은 [etl/load_policies.py](etl/load_policies.py)입니다.
 
-## 3. PostgreSQL / pgvector와 9개 테이블
+## 3. PostgreSQL / pgvector와 주요 테이블
 
 PostgreSQL에는 정책의 정형 조건과 API 원문(`JSONB`)을 함께 저장합니다. pgvector는 향후 정책 설명의 의미를 비교하는 벡터 검색에 사용합니다.
 
@@ -52,12 +55,16 @@ PostgreSQL에는 정책의 정형 조건과 API 원문(`JSONB`)을 함께 저장
 | `common_code` | API 코드, 코드 그룹, 사람이 읽는 이름 | SQL seed |
 | `policy` | 정책 번호·이름·지원 내용·나이·소득·기간·기관·URL·원문 | ETL UPSERT |
 | `policy_region` | 정책별 대상 지역 코드. `(policy_no, region_code)`가 기본키 | ETL 재동기화 |
+| `region` | VWorld 기준 현재 시도·시군구 코드와 이름 | 지역 ETL UPSERT |
+| `region_code_mapping` | 과거·폐지·분할·상위 지역 코드를 현재 코드에 연결 | SQL seed |
 | `policy_eligibility_code` | 전공·취업·학력·특화 대상의 복수 조건 코드 | ETL 재동기화 |
 | `policy_chunk` | 정책을 나눈 텍스트와 임베딩 | 스키마 준비, 생성 작업은 다음 단계 |
 | `chat_room` | 대화방 | 스키마 준비 |
 | `chat_profile` | 대화방별 사용자 나이·지역·소득 등 추천 조건 | 스키마 준비 |
 | `chat_message` | 대화방의 사용자·챗봇 메시지 | 스키마 준비 |
 | `message_policy_ref` | 메시지가 참조한 정책과 관련도 점수 | 스키마 준비 |
+
+`v_policy_region_resolved`는 `policy_region`, `region_code_mapping`, `region`을 결합하는 조회용 View입니다. 원본 코드가 현재 코드이면 `DIRECT`, 매핑을 거치면 `MAPPED`, 어느 쪽에서도 해석되지 않으면 `UNRESOLVED`로 표시합니다.
 
 정책 하나에는 여러 지역·자격 조건·청크가 연결됩니다. 대화방에는 프로필 하나와 여러 메시지가 연결되며, 메시지와 정책은 `message_policy_ref`로 연결합니다. `common_code`는 코드 해석용 사전이며, 현재 정책의 코드 컬럼에 공통 코드 외래키를 강제하지는 않습니다.
 
@@ -79,6 +86,8 @@ psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/s
 이미 `youthlink` DB가 있다면 생성 명령은 생략합니다. 확장 설치 권한이 없으면 DB 관리자에게 `vector`, `pgcrypto` 활성화를 요청합니다. pgAdmin을 사용한다면 같은 DB의 Query Tool에서 위 SQL 파일 내용을 순서대로 실행해도 됩니다.
 
 `schema.sql`의 `CREATE TABLE IF NOT EXISTS`는 기존 테이블 구조를 최신 형태로 변경하는 마이그레이션이 아닙니다. 이후 컬럼·제약조건 변경은 별도 마이그레이션으로 관리해야 합니다.
+
+지역 코드 기능을 사용하는 환경에서는 `db/migrations/`의 SQL 파일을 파일명 번호 순서대로 적용하고, `db/seed/region_code_mapping.sql`을 실행합니다. `region`과 `region_code_mapping`이 생성된 뒤 `v_policy_region_resolved` View를 생성해야 합니다.
 
 ### common_code seed
 
@@ -138,6 +147,10 @@ YOUTH_API_URL=
 YOUTH_API_KEY=
 YOUTH_API_PAGE_SIZE=100
 
+# VWorld API
+VWORLD_API_KEY=
+VWORLD_API_DOMAIN=http://localhost
+
 # PostgreSQL
 DATABASE_URL=postgresql://postgres:YOUR_PASSWORD@localhost:5432/youthlink
 ```
@@ -147,11 +160,13 @@ DATABASE_URL=postgresql://postgres:YOUR_PASSWORD@localhost:5432/youthlink
 | `YOUTH_API_URL` | 온통청년 정책 조회 API의 기본 요청 주소. 키가 포함된 전체 요청 URL을 넣지 않음 |
 | `YOUTH_API_KEY` | 발급받은 인증키. 개인 `.env`에만 입력 |
 | `YOUTH_API_PAGE_SIZE` | 페이지당 요청 건수. 기본 100, API 허용 범위 내의 양수 사용 |
+| `VWORLD_API_KEY` | VWorld에서 발급받은 인증키. 개인 `.env`에만 입력 |
+| `VWORLD_API_DOMAIN` | VWorld 인증키에 등록한 요청 도메인. 로컬 개발은 보통 `http://localhost` 사용 |
 | `DATABASE_URL` | 적재 대상 PostgreSQL 연결 문자열 |
 
 `YOUR_PASSWORD`는 자리표시자입니다. 실제 DB 사용자와 비밀번호로 변경하고, 연결 문자열의 비밀번호에 `@`, `:`, `/` 등 특수문자가 있으면 URL 인코딩해야 합니다. Python 실행 시 `load_dotenv()`가 설정을 읽습니다. 일반 `psql` 명령은 이 `.env`를 자동으로 읽지 않습니다.
 
-파일 모드는 DB 설정만 필요하고, API 모드는 네 항목을 모두 확인해야 합니다. 임베딩 API 키는 현재 정책 수집 ETL에 필요하지 않습니다.
+정책 파일 모드는 DB 설정만 필요하고, 정책 API 모드는 `YOUTH_API_*`와 DB 설정을 확인해야 합니다. 지역 동기화에는 `VWORLD_API_KEY`, `VWORLD_API_DOMAIN`, `DATABASE_URL`이 필요합니다. VWorld 인증키의 허용 도메인과 `VWORLD_API_DOMAIN` 값이 다르면 요청이 거절될 수 있습니다. 임베딩 API 키는 현재 정책·지역 수집 ETL에 필요하지 않습니다.
 
 ## 6. 샘플 JSON 테스트
 
@@ -225,7 +240,85 @@ flowchart TD
 
 빈 문자열은 기본적으로 `NULL`, `Y/N`은 불리언으로 변환합니다. 파싱하지 못한 날짜는 `NULL`이 될 수 있으므로 적재 성공만으로 정제 품질이 보장되지는 않습니다. 현재 `normalize_age_range()`는 정의만 되어 있고 변환에서 호출하지 않아, 양수 나이가 역전된 경우에는 DB 제약조건으로 실패합니다.
 
-## 8. 실패 레코드 로깅과 계속 진행
+## 8. 지역 코드 처리
+
+온통청년 API의 `zipCd`는 5자리 시군구 코드입니다. 정책 수집 시 이 값은 임의로 현재 코드로 치환하지 않고 `policy_region.region_code`에 원본 그대로 보존합니다. 이렇게 하면 원천 데이터의 추적 가능성을 유지하면서도, 별도의 지역 마스터와 매핑을 통해 현재 행정구역 기준으로 조회할 수 있습니다.
+
+현재 지역 코드와 이름은 VWorld의 시도·시군구 조회 API를 통해 `region` 테이블에 주기적으로 동기화합니다. 관련 객체의 역할은 다음과 같습니다.
+
+| 객체 | 역할 |
+| --- | --- |
+| `policy_region` | 온통청년 정책에 포함된 원본 `zipCd` 보존 |
+| `region` | VWorld 기준 현재 시도·시군구 코드, 이름, 활성 상태 관리 |
+| `region_code_mapping` | 폐지 코드, 분할 지역, 상위 지역 코드를 하나 이상의 현재 코드로 연결 |
+| `v_policy_region_resolved` | 원본 코드를 현재 코드와 지역명으로 해석하여 RAG·백엔드에 제공 |
+
+`region_code_mapping`은 `(source_code, canonical_code)`를 기준으로 1:N 매핑을 지원합니다. 하나의 과거 코드가 여러 현재 행정구역으로 분할된 경우 View 결과도 여러 행으로 확장됩니다.
+
+### 지역 마스터 동기화
+
+먼저 `.env.example`을 참고하여 개인 `.env`에 `VWORLD_API_KEY`와 `VWORLD_API_DOMAIN`을 설정한 뒤 저장소 루트에서 실행합니다.
+
+```bash
+python etl/load_regions.py
+```
+
+지역 ETL은 VWorld에서 시도·시군구 목록을 조회하고 응답의 중복, 코드 형식, 최소 지역 수 등을 검증한 뒤 `region`을 UPSERT합니다. 동기화가 끝나면 `policy_region`의 원본 코드 중 `region`에도 없고 `region_code_mapping`에도 없는 코드를 자동으로 검사합니다. 정상 상태에서는 다음과 같이 미해결 코드가 0건으로 표시됩니다.
+
+```text
+=== policy region validation ===
+unresolved region codes: 0
+all policy regions resolved: OK
+```
+
+`[WARN] unresolved region codes`가 출력되면 해당 코드를 임의로 버리거나 원본 값을 수정하지 말고, VWorld의 신규 코드인지 행정구역 변경 이력인지 확인한 후 `region_code_mapping`을 보완합니다.
+
+### RAG·백엔드 조회
+
+RAG와 백엔드에서는 원본 `policy_region`을 직접 필터링하기보다 `v_policy_region_resolved.resolved_region_code`를 사용하는 것을 권장합니다. View의 `resolution_type`은 다음 의미를 가집니다.
+
+- `DIRECT`: 원본 코드가 현재 `region` 코드와 직접 일치
+- `MAPPED`: 과거·상위 코드가 `region_code_mapping`을 통해 현재 코드로 변환
+- `UNRESOLVED`: 현재 지역과 매핑 어디에서도 해석되지 않음
+
+특정 현재 지역에 적용되는 정책은 다음과 같이 조회합니다. 이 쿼리는 해당 현재 코드로 저장된 정책뿐 아니라 그 코드로 매핑되는 과거 코드의 정책도 함께 찾습니다.
+
+```sql
+SELECT DISTINCT
+    p.policy_no,
+    p.policy_name
+FROM policy p
+JOIN v_policy_region_resolved r
+  ON r.policy_no = p.policy_no
+WHERE r.resolved_region_code = '28125';
+```
+
+정책별 지역명을 RAG context에 포함하려면 다음과 같이 조회할 수 있습니다.
+
+```sql
+SELECT DISTINCT
+    p.policy_no,
+    p.policy_name,
+    r.region_name
+FROM policy p
+JOIN v_policy_region_resolved r
+  ON r.policy_no = p.policy_no
+WHERE p.policy_no = '정책번호';
+```
+
+운영 중에는 지역 동기화 후 아래 쿼리로 미해결 코드와 영향을 받는 정책 수를 별도로 확인할 수 있습니다. 결과가 0행이어야 모든 원본 지역 코드를 해석할 수 있는 상태입니다.
+
+```sql
+SELECT
+    source_region_code,
+    COUNT(DISTINCT policy_no) AS policy_count
+FROM v_policy_region_resolved
+WHERE resolution_type = 'UNRESOLVED'
+GROUP BY source_region_code
+ORDER BY source_region_code;
+```
+
+## 9. 실패 레코드 로깅과 계속 진행
 
 API 모드는 **페이지 단위 트랜잭션 안에 정책별 SAVEPOINT**를 둡니다. 정책 저장 중 오류가 나면 그 정책의 변경만 롤백하고, 실패 내용을 기록한 뒤 다음 정책을 처리합니다. 지역·자격 조건을 갱신하다 실패해도 해당 정책의 기존 데이터까지 부분적으로 바뀐 상태로 남지 않도록 같은 SAVEPOINT로 묶습니다.
 
@@ -246,7 +339,7 @@ API 모드는 **페이지 단위 트랜잭션 안에 정책별 SAVEPOINT**를 �
 - API 오류 응답에 정책 목록이 없으면 빈 목록으로 인식할 수 있습니다. 업무 오류 코드와 응답 구조 검증은 보완해야 합니다.
 - 종료 요약의 `success`는 신규 삽입과 기존 갱신을 합한 처리 건수이며 DB 전체 행 수와 다를 수 있습니다. 처리 실패 건이 있어도 현재 CLI는 별도의 실패 종료 코드를 설정하지 않습니다.
 
-## 9. UPSERT와 주기 동기화 전략
+## 10. UPSERT와 주기 동기화 전략
 
 `policy_no`를 기준으로 신규 정책은 INSERT, 기존 정책은 UPDATE합니다. 기존 정책의 수집 대상 컬럼과 `raw_data`를 최신 응답으로 교체하고 `synced_at`을 갱신합니다. `source_updated_at`은 원천 API의 수정 시각이고, `synced_at`은 DB 동기화 시각입니다.
 
@@ -262,7 +355,7 @@ API 모드는 **페이지 단위 트랜잭션 안에 정책별 SAVEPOINT**를 �
 
 **API에서 사라진 정책은 현재 DB에서 자동 삭제되지 않습니다.** 향후 `is_active`, 실행별 마지막 확인 정보 등을 도입할 수 있습니다. 누락 정책 비활성화는 전체 페이지를 정상 수집한 실행에만 적용해야 하며, 중간 실패나 일시적인 API 누락으로 대량 비활성화하지 않도록 설계해야 합니다. 이 컬럼과 처리는 아직 구현되지 않았습니다.
 
-## 10. 검증 SQL
+## 11. 검증 SQL
 
 다음 SQL은 초기화한 `youthlink` DB에서 실행합니다.
 
@@ -280,7 +373,7 @@ WHERE table_schema = 'public'
 ORDER BY table_name;
 ```
 
-전용 새 DB라면 위 9개 테이블이 보여야 합니다.
+`schema.sql`만 적용한 전용 새 DB라면 기존 9개 테이블이 보여야 합니다. 지역 마이그레이션까지 적용했다면 `region`, `region_code_mapping`이 추가로 보여야 하며, View는 `information_schema.views`에서 `v_policy_region_resolved`를 확인합니다.
 
 ### 공통 코드와 적재 건수
 
@@ -360,11 +453,14 @@ LIMIT 30;
 
 DB에 들어간 행만 검사하면 롤백된 실패 정책은 보이지 않습니다. 종료 요약과 JSONL 로그도 함께 확인하세요. 재실행 후 건수 비교는 같은 샘플을 사용하는 것이 좋고, 실제 API는 실행 사이에 원천 데이터가 바뀔 수 있습니다.
 
-## 11. 현재까지 완료된 작업과 다음 단계
+## 12. 현재까지 완료된 작업과 다음 단계
 
 ### 코드·설정으로 준비된 항목
 
-- PostgreSQL 확장 설정 및 9개 테이블·관계·제약조건·인덱스 정의
+- PostgreSQL 확장 설정 및 기존 9개 테이블·관계·제약조건·인덱스 정의
+- VWorld 시도·시군구 동기화와 `region` 지역 마스터 관리
+- 과거·분할·상위 지역 코드의 1:N 매핑과 `v_policy_region_resolved` 제공
+- 지역 동기화 후 미해결 온통청년 코드 자동 검증
 - pgvector 1536차원 컬럼과 코사인 HNSW 인덱스 정의
 - 공통 코드 seed와 재실행 가능한 코드 갱신
 - 온통청년 API 페이지 요청, 데이터 정제, 원문 JSONB 보존
@@ -373,13 +469,3 @@ DB에 들어간 행만 검사하면 롤백된 실패 정책은 보이지 않습�
 - 고정 총건수 상한 없이 페이지를 순회하는 수집
 - 샘플 파일 처리 함수, 환경변수 템플릿, 의존성 목록 및 Git 제외 규칙
 
-### 다음 단계
-
-- **우선:** 6절의 CLI 분기를 수정하고 샘플 → 재실행 → 실제 API 순서로 DB 검증
-- 파일 모드에도 정책별 실패 처리 적용 여부 결정
-- 나이 역전·소득·비정형 기간·미등록 코드의 정제 기준 보완
-- API 업무 오류 검사, 재시도, 실행 이력과 종료 상태 관리
-- 주기 실행과 동시 실행 방지, 누락 정책 상태 관리
-- 정책 청크 생성·임베딩 적재·벡터 검색 및 갱신 연결
-- 사용자 조건 필터링, RAG 응답, 정책 출처 표시, 채팅 저장 구현
-- 스키마 마이그레이션과 핵심 변환·재실행·롤백 동작의 자동 검증
