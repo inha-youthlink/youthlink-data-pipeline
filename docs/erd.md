@@ -196,11 +196,24 @@ erDiagram
 
 `v_policy_region_resolved`는 RAG와 백엔드가 지역 코드의 변경 이력을 매번 직접 처리하지 않도록 다음 세 객체를 결합한 조회용 View입니다.
 
-```text
-v_policy_region_resolved
-= policy_region
-  + region_code_mapping
-  + region
+```mermaid
+flowchart LR
+
+    PR["policy_region<br/><br/>policy_no<br/>region_code"]
+
+    MAP["region_code_mapping<br/><br/>source_code<br/>canonical_code<br/>mapping_type"]
+
+    REGION["region<br/><br/>region_code<br/>sido_name<br/>sigungu_name<br/>region_name"]
+
+    VIEW["v_policy_region_resolved<br/><br/>policy_no<br/>source_region_code<br/>resolved_region_code<br/>region_name<br/>resolution_type<br/>mapping_type"]
+
+    PR -->|"현재 코드 직접 매칭"| REGION
+    PR -->|"과거 / 상위 코드"| MAP
+    MAP -->|"canonical_code"| REGION
+
+    REGION --> VIEW
+    PR --> VIEW
+    MAP --> VIEW
 ```
 
 View는 정책별 원본 코드와 해석된 현재 코드·지역명을 함께 제공하며, 해석 방식은 `resolution_type`으로 구분합니다.
