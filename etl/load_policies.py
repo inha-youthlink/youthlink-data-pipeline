@@ -1,11 +1,12 @@
 from __future__ import annotations
-from pathlib import Path
 
+import argparse
 import json
 import os
 import re
 from dataclasses import dataclass
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any, Iterable
 
 import psycopg
@@ -147,30 +148,75 @@ def parse_timestamp(value: Any) -> datetime | None:
     return None
 
 
-_APPLICATION_RANGE_RE = re.compile(
-    r"^\s*(\d{8})\s*~\s*(\d{8})\s*$"
-)
+_APPLICATION_RANGE_RE = re.compile(r"^\s*(\d{8})\s*~\s*(\d{8})\s*$")
+_APPLICATION_PERIOD_SEPARATOR_RE = re.compile(r"(?:\\N|\r\n|\r|\n)+")
+_MIN_APPLICATION_DATE = date(1900, 1, 1)
 
 
-def parse_application_period(value: Any) -> tuple[date | None, date | None, str | None]:
+@dataclass(frozen=True)
+class ParsedApplicationPeriod:
+    raw: str | None
+    periods: tuple[tuple[date, date], ...]
+    status: str
+
+    @property
+    def legacy_start_date(self) -> date | None:
+        if len(self.periods) == 1:
+            return self.periods[0][0]
+        return None
+
+    @property
+    def legacy_end_date(self) -> date | None:
+        if len(self.periods) == 1:
+            return self.periods[0][1]
+        return None
+
+
+def parse_application_period(value: Any) -> ParsedApplicationPeriod:
     """
-    Example API value:
-      20260223 ~ 20260313
+    Parse one or more application periods separated by a literal ``\\N`` or
+    an actual newline.
 
-    If the string cannot be parsed, dates remain NULL and the original
-    value is preserved in application_period_raw.
+    The legacy columns on ``policy`` are populated only when there is exactly
+    one trusted period. Multiple periods are stored in
+    ``policy_application_period`` so gaps between periods are not presented as
+    continuously open. Invalid, reversed, or pre-1900 dates keep only the raw
+    value and never make the policy load fail.
     """
     raw = clean_text(value)
     if not raw:
-        return None, None, None
+        return ParsedApplicationPeriod(raw=None, periods=(), status="EMPTY")
 
-    match = _APPLICATION_RANGE_RE.match(raw)
-    if not match:
-        return None, None, raw
+    segments = [
+        segment.strip()
+        for segment in _APPLICATION_PERIOD_SEPARATOR_RE.split(raw)
+        if segment.strip()
+    ]
+    periods: list[tuple[date, date]] = []
 
-    start = parse_yyyymmdd(match.group(1))
-    end = parse_yyyymmdd(match.group(2))
-    return start, end, raw
+    for segment in segments:
+        match = _APPLICATION_RANGE_RE.fullmatch(segment)
+        if not match:
+            return ParsedApplicationPeriod(raw=raw, periods=(), status="RAW")
+
+        start = parse_yyyymmdd(match.group(1))
+        end = parse_yyyymmdd(match.group(2))
+        if (
+            start is None
+            or end is None
+            or start < _MIN_APPLICATION_DATE
+            or end < _MIN_APPLICATION_DATE
+            or start > end
+        ):
+            return ParsedApplicationPeriod(raw=raw, periods=(), status="INVALID")
+
+        periods.append((start, end))
+
+    return ParsedApplicationPeriod(
+        raw=raw,
+        periods=tuple(periods),
+        status="SINGLE" if len(periods) == 1 else "MULTIPLE",
+    )
 
 
 def paired_categories(large_raw: Any, middle_raw: Any) -> tuple[list[str], list[str]]:
@@ -190,6 +236,7 @@ class PolicyRecord:
     policy: dict[str, Any]
     regions: list[str]
     eligibility_codes: list[tuple[str, str]]
+    application_periods: tuple[tuple[date, date], ...]
 
 
 def transform_policy(item: dict[str, Any]) -> PolicyRecord:
@@ -197,10 +244,14 @@ def transform_policy(item: dict[str, Any]) -> PolicyRecord:
     if not policy_no:
         raise ValueError("plcyNo is required")
 
-    app_start, app_end, app_raw = parse_application_period(item.get("aplyYmd"))
+    application_period = parse_application_period(item.get("aplyYmd"))
     large_categories, middle_categories = paired_categories(
         item.get("lclsfNm"),
         item.get("mclsfNm"),
+    )
+    min_age, max_age = normalize_age_range(
+        item.get("sprtTrgtMinAge"),
+        item.get("sprtTrgtMaxAge"),
     )
 
     policy = {
@@ -228,8 +279,8 @@ def transform_policy(item: dict[str, Any]) -> PolicyRecord:
         "support_scale_count": to_int(item.get("sprtSclCnt")),
         "first_come_first_served": yn_to_bool(item.get("sprtArvlSeqYn")),
 
-        "min_age": to_age(item.get("sprtTrgtMinAge")),
-        "max_age": to_age(item.get("sprtTrgtMaxAge")),
+        "min_age": min_age,
+        "max_age": max_age,
         "age_limit_yn": yn_to_bool(item.get("sprtTrgtAgeLmtYn")),
 
         "marriage_status_code": clean_text(item.get("mrgSttsCd")),
@@ -240,9 +291,10 @@ def transform_policy(item: dict[str, Any]) -> PolicyRecord:
         "income_etc": clean_text(item.get("earnEtcCn")),
 
         "application_period_type_code": clean_text(item.get("aplyPrdSeCd")),
-        "application_start_date": app_start,
-        "application_end_date": app_end,
-        "application_period_raw": app_raw,
+        "application_start_date": application_period.legacy_start_date,
+        "application_end_date": application_period.legacy_end_date,
+        "application_period_raw": application_period.raw,
+        "application_period_parse_status": application_period.status,
 
         "business_period_type_code": clean_text(item.get("bizPrdSeCd")),
         "business_start_date": parse_yyyymmdd(item.get("bizPrdBgngYmd")),
@@ -288,6 +340,7 @@ def transform_policy(item: dict[str, Any]) -> PolicyRecord:
         policy=policy,
         regions=regions,
         eligibility_codes=eligibility_codes,
+        application_periods=application_period.periods,
     )
 
 
@@ -327,6 +380,7 @@ POLICY_COLUMNS = [
     "application_start_date",
     "application_end_date",
     "application_period_raw",
+    "application_period_parse_status",
     "business_period_type_code",
     "business_start_date",
     "business_end_date",
@@ -379,12 +433,36 @@ def load_policy(cur: psycopg.Cursor, record: PolicyRecord) -> None:
     """
     Idempotent per-policy load:
       1) UPSERT policy
-      2) replace regions
-      3) replace eligibility-code rows
+      2) replace application periods
+      3) replace regions
+      4) replace eligibility-code rows
     """
     cur.execute(POLICY_UPSERT_SQL, record.policy)
 
     policy_no = record.policy["policy_no"]
+
+    cur.execute(
+        "DELETE FROM policy_application_period WHERE policy_no = %s",
+        (policy_no,),
+    )
+
+    if record.application_periods:
+        cur.executemany(
+            """
+            INSERT INTO policy_application_period (
+                policy_no,
+                period_index,
+                start_date,
+                end_date
+            )
+            VALUES (%s, %s, %s, %s)
+            """,
+            [
+                (policy_no, index, start_date, end_date)
+                for index, (start_date, end_date)
+                in enumerate(record.application_periods)
+            ],
+        )
 
     cur.execute(
         "DELETE FROM policy_region WHERE policy_no = %s",
@@ -441,11 +519,84 @@ def load_items(items: Iterable[dict[str, Any]]) -> int:
     return loaded
 
 
+def backfill_application_periods() -> tuple[int, int, int]:
+    """Re-parse stored API values after migration 006 without calling the API."""
+    processed = 0
+    parsed = 0
+    invalid_or_empty = 0
+
+    with psycopg.connect(DB_DSN) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT policy_no, application_period_raw
+                FROM policy
+                ORDER BY policy_no
+                """
+            )
+            rows = cur.fetchall()
+
+            for policy_no, raw in rows:
+                result = parse_application_period(raw)
+                cur.execute(
+                    """
+                    UPDATE policy
+                    SET application_start_date = %s,
+                        application_end_date = %s,
+                        application_period_parse_status = %s
+                    WHERE policy_no = %s
+                    """,
+                    (
+                        result.legacy_start_date,
+                        result.legacy_end_date,
+                        result.status,
+                        policy_no,
+                    ),
+                )
+                cur.execute(
+                    "DELETE FROM policy_application_period WHERE policy_no = %s",
+                    (policy_no,),
+                )
+                if result.periods:
+                    cur.executemany(
+                        """
+                        INSERT INTO policy_application_period (
+                            policy_no,
+                            period_index,
+                            start_date,
+                            end_date
+                        )
+                        VALUES (%s, %s, %s, %s)
+                        """,
+                        [
+                            (policy_no, index, start_date, end_date)
+                            for index, (start_date, end_date)
+                            in enumerate(result.periods)
+                        ],
+                    )
+                    parsed += 1
+                else:
+                    invalid_or_empty += 1
+                processed += 1
+
+        conn.commit()
+
+    return processed, parsed, invalid_or_empty
+
+
 # ============================================================
 # 온통청년 API
 # ============================================================
 
+def validate_page_size(page_size: int) -> int:
+    if page_size <= 0:
+        raise ValueError("page_size must be a positive integer")
+    return page_size
+
+
 def fetch_page(page_num: int, page_size: int = DEFAULT_PAGE_SIZE) -> dict[str, Any]:
+    validate_page_size(page_size)
+
     if not API_URL:
         raise RuntimeError("YOUTH_API_URL is not set")
     if not API_KEY:
@@ -473,14 +624,40 @@ def extract_page(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
         │    └─ totCount
         └─ youthPolicyList
     """
-    result = payload.get("result") or {}
-    items = result.get("youthPolicyList") or []
-    paging = result.get("pagging") or {}
+    if not isinstance(payload, dict):
+        raise ValueError("API response must be a JSON object")
+
+    if "result" not in payload:
+        raise ValueError("API response is missing 'result'")
+
+    result = payload["result"]
+    if not isinstance(result, dict):
+        raise ValueError("API response 'result' must be an object")
+
+    if "youthPolicyList" not in result:
+        raise ValueError("API response is missing 'result.youthPolicyList'")
+
+    items = result["youthPolicyList"]
+    if not isinstance(items, list):
+        raise ValueError("API response 'result.youthPolicyList' must be a list")
+    if any(not isinstance(item, dict) for item in items):
+        raise ValueError(
+            "API response 'result.youthPolicyList' must contain only objects"
+        )
+
+    paging = result.get("pagging", {})
+    if paging is None:
+        paging = {}
+    if not isinstance(paging, dict):
+        raise ValueError("API response 'result.pagging' must be an object")
+
     total_count = to_int(paging.get("totCount")) or len(items)
     return items, total_count
 
 
 def run_api_etl(page_size: int = DEFAULT_PAGE_SIZE) -> tuple[int, int]:
+    validate_page_size(page_size)
+
     success_count = 0
     failed_count = 0
     processed_count = 0
@@ -568,35 +745,63 @@ def run_json_file(path: str) -> int:
     return loaded
 
 
-if __name__ == "__main__":
-    import argparse
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+        return validate_page_size(parsed)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(
+            "page size must be a positive integer"
+        ) from error
 
+
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
 
     api_parser = sub.add_parser("api", help="Load all pages from the Youth API")
     api_parser.add_argument(
         "--page-size",
-        type=int,
+        type=positive_int,
         default=DEFAULT_PAGE_SIZE,
     )
 
     file_parser = sub.add_parser("file", help="Load a local JSON response")
     file_parser.add_argument("path")
 
-    args = parser.parse_args()
+    sub.add_parser(
+        "backfill-periods",
+        help="Re-parse stored application periods without calling the API",
+    )
 
-if args.command == "api":
-    success_count, failed_count = run_api_etl(args.page_size)
+    return parser
 
-    print()
-    print("========== ETL RESULT ==========")
-    print(f"success : {success_count}")
-    print(f"failed  : {failed_count}")
-    print(f"total   : {success_count + failed_count}")
-    print("================================")
 
-    if failed_count > 0:
-        print(f"failed log: {FAILED_LOG_PATH}")
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+
+    if args.command == "api":
+        success_count, failed_count = run_api_etl(args.page_size)
+
+        print()
+        print("========== ETL RESULT ==========")
+        print(f"success : {success_count}")
+        print(f"failed  : {failed_count}")
+        print(f"total   : {success_count + failed_count}")
+        print("================================")
+
+        if failed_count > 0:
+            print(f"failed log: {FAILED_LOG_PATH}")
     elif args.command == "file":
         run_json_file(args.path)
+    elif args.command == "backfill-periods":
+        processed, parsed, invalid_or_empty = backfill_application_periods()
+        print(f"processed        : {processed}")
+        print(f"parsed           : {parsed}")
+        print(f"invalid_or_empty : {invalid_or_empty}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

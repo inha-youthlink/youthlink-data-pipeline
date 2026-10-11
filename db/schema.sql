@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS policy (
     application_start_date          DATE,
     application_end_date            DATE,
     application_period_raw          TEXT,
+    application_period_parse_status VARCHAR(20) NOT NULL DEFAULT 'EMPTY',
 
     business_period_type_code       VARCHAR(30),
     business_start_date             DATE,
@@ -99,6 +100,13 @@ CREATE TABLE IF NOT EXISTS policy (
             OR application_start_date <= application_end_date
         ),
 
+    CONSTRAINT chk_policy_application_period_parse_status
+        CHECK (
+            application_period_parse_status IN (
+                'EMPTY', 'SINGLE', 'MULTIPLE', 'RAW', 'INVALID'
+            )
+        ),
+
     CONSTRAINT chk_policy_business_period
         CHECK (
             business_start_date IS NULL
@@ -130,6 +138,33 @@ CREATE INDEX IF NOT EXISTS idx_policy_large_categories_gin
 
 CREATE INDEX IF NOT EXISTS idx_policy_middle_categories_gin
     ON policy USING GIN (middle_categories);
+
+CREATE TABLE IF NOT EXISTS policy_application_period (
+    policy_no       VARCHAR(30) NOT NULL,
+    period_index    INTEGER NOT NULL,
+    start_date      DATE NOT NULL,
+    end_date        DATE NOT NULL,
+
+    PRIMARY KEY (policy_no, period_index),
+
+    CONSTRAINT fk_policy_application_period_policy
+        FOREIGN KEY (policy_no)
+        REFERENCES policy (policy_no)
+        ON DELETE CASCADE,
+
+    CONSTRAINT chk_policy_application_period_index
+        CHECK (period_index >= 0),
+
+    CONSTRAINT chk_policy_application_period_valid_date
+        CHECK (
+            start_date >= DATE '1900-01-01'
+            AND end_date >= DATE '1900-01-01'
+            AND start_date <= end_date
+        )
+);
+
+CREATE INDEX IF NOT EXISTS idx_policy_application_period_dates
+    ON policy_application_period (start_date, end_date);
 
 CREATE TABLE IF NOT EXISTS policy_region (
     policy_no       VARCHAR(30) NOT NULL,
@@ -177,10 +212,17 @@ CREATE TABLE IF NOT EXISTS policy_chunk (
     chunk_type          VARCHAR(30) NOT NULL,
     content             TEXT NOT NULL,
 
+    content_hash        VARCHAR(64) NOT NULL,
+    chunker_version     VARCHAR(50) NOT NULL,
+    token_count         INTEGER,
+
     embedding           VECTOR(1536),
-    embedding_model     VARCHAR(100) NOT NULL DEFAULT 'text-embedding-3-small',
+    embedding_model     VARCHAR(100),
+    embedded_at         TIMESTAMPTZ,
+    embedding_error     TEXT,
 
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
     CONSTRAINT fk_policy_chunk_policy
         FOREIGN KEY (policy_no)
@@ -190,8 +232,38 @@ CREATE TABLE IF NOT EXISTS policy_chunk (
     CONSTRAINT chk_policy_chunk_index
         CHECK (chunk_index >= 0),
 
+    CONSTRAINT chk_policy_chunk_type
+        CHECK (chunk_type IN ('SUMMARY', 'ELIGIBILITY', 'SUPPORT', 'APPLICATION')),
+
+    CONSTRAINT chk_policy_chunk_content_not_blank
+        CHECK (BTRIM(content) <> ''),
+
+    CONSTRAINT chk_policy_chunk_content_hash
+        CHECK (content_hash ~ '^[0-9a-f]{64}$'),
+
+    CONSTRAINT chk_policy_chunk_token_count
+        CHECK (token_count IS NULL OR token_count >= 0),
+
+    CONSTRAINT chk_policy_chunk_embedding_state
+        CHECK (
+            (
+                embedding IS NULL
+                AND embedding_model IS NULL
+                AND embedded_at IS NULL
+            )
+            OR
+            (
+                embedding IS NOT NULL
+                AND embedding_model IS NOT NULL
+                AND embedded_at IS NOT NULL
+            )
+        ),
+
     CONSTRAINT uq_policy_chunk_order
-        UNIQUE (policy_no, chunk_index)
+        UNIQUE (policy_no, chunk_index),
+
+    CONSTRAINT uq_policy_chunk_type
+        UNIQUE (policy_no, chunk_type)
 );
 
 CREATE INDEX IF NOT EXISTS idx_policy_chunk_policy_no

@@ -44,6 +44,7 @@ erDiagram
         date application_start_date
         date application_end_date
         text application_period_raw
+        varchar application_period_parse_status
 
         varchar business_period_type_code
         date business_start_date
@@ -74,6 +75,13 @@ erDiagram
     POLICY_REGION {
         varchar policy_no PK,FK
         varchar region_code PK
+    }
+
+    POLICY_APPLICATION_PERIOD {
+        varchar policy_no PK,FK
+        integer period_index PK
+        date start_date
+        date end_date
     }
 
     REGION {
@@ -156,6 +164,7 @@ erDiagram
     }
 
     POLICY ||--o{ POLICY_REGION : "applies to"
+    POLICY ||--o{ POLICY_APPLICATION_PERIOD : "accepts applications during"
     REGION ||--o{ REGION_CODE_MAPPING : "canonical region"
     POLICY ||--o{ POLICY_ELIGIBILITY_CODE : "has condition"
     POLICY ||--o{ POLICY_CHUNK : "chunked into"
@@ -171,6 +180,7 @@ erDiagram
 
 ### Policy domain
 - `policy`
+- `policy_application_period`
 - `policy_region`
 - `region`
 - `region_code_mapping`
@@ -194,7 +204,7 @@ erDiagram
 
 ## `v_policy_region_resolved` View
 
-`v_policy_region_resolved`는 RAG와 백엔드가 지역 코드의 변경 이력을 매번 직접 처리하지 않도록 다음 세 객체를 결합한 조회용 View입니다.
+`v_policy_region_resolved`는 RAG와 백엔드가 지역 코드의 변경 이력과 검증된 범위 누락을 매번 직접 처리하지 않도록 제공하는 조회용 View입니다.
 
 ```mermaid
 flowchart LR
@@ -205,11 +215,15 @@ flowchart LR
 
     REGION["region<br/><br/>region_code<br/>sido_name<br/>sigungu_name<br/>region_name"]
 
+    RULE["인천 9개 코드 범위 규칙<br/><br/>영종구·서해구 보정"]
+
     VIEW["v_policy_region_resolved<br/><br/>policy_no<br/>source_region_code<br/>resolved_region_code<br/>region_name<br/>resolution_type<br/>mapping_type"]
 
     PR -->|"현재 코드 직접 매칭"| REGION
     PR -->|"과거 / 상위 코드"| MAP
+    PR -->|"정확한 9개 코드 집합"| RULE
     MAP -->|"canonical_code"| REGION
+    RULE -->|"INFERRED"| REGION
 
     REGION --> VIEW
     PR --> VIEW
@@ -222,6 +236,24 @@ View는 정책별 원본 코드와 해석된 현재 코드·지역명을 함께 
 | --- | --- |
 | `DIRECT` | `policy_region.region_code`가 현재 `region.region_code`와 직접 일치 |
 | `MAPPED` | 원본 코드가 `region_code_mapping`을 거쳐 하나 이상의 현재 코드로 해석됨 |
+| `INFERRED` | 검증된 코드 집합 규칙으로 누락 지역을 보정. 단일 원본 코드가 없어 `source_region_code`는 `NULL` |
 | `UNRESOLVED` | 현재 지역과 매핑 어디에서도 원본 코드를 해석할 수 없음 |
 
 주요 컬럼은 `policy_no`, `source_region_code`, `resolved_region_code`, `sido_code`, `sigungu_code`, `sido_name`, `sigungu_name`, `region_name`, `is_active`, `resolution_type`, `mapping_type`, `valid_from`, `valid_to`입니다. RAG·백엔드의 지역 필터는 원본 코드 대신 `resolved_region_code`를 사용하고, 운영 점검에서는 `resolution_type = 'UNRESOLVED'`인 행을 확인합니다.
+
+## 지역 범위 판정 View
+
+```mermaid
+flowchart LR
+    RESOLVED["v_policy_region_resolved"]
+    MASTER["region<br/>활성 지역 집합"]
+    GLOBAL["v_policy_region_scope<br/>NATIONWIDE / PARTIAL / UNKNOWN"]
+    SIDO["v_policy_sido_scope<br/>SIDO_WIDE / PARTIAL"]
+
+    RESOLVED --> GLOBAL
+    MASTER --> GLOBAL
+    RESOLVED --> SIDO
+    MASTER --> SIDO
+```
+
+`v_policy_region_scope`는 정책당 한 행으로 전국 범위를 판정합니다. `v_policy_sido_scope`는 정책·시도별 한 행으로 해당 시도의 전체 시군구를 포함하는지 판정합니다. RAG와 백엔드가 이 View를 함께 사용하면 `전국`, `{시도명} 전체` 계산이 서로 달라지는 문제를 피할 수 있습니다.
