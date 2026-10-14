@@ -9,7 +9,7 @@
 - **한 행의 의미**는 해당 테이블의 튜플(row) 하나가 무엇을 나타내는지 설명합니다.
 - `PK`는 기본키, `FK`는 외래키, `UNIQUE`는 중복 방지 제약조건입니다.
 - 외부 API 코드에는 의도적으로 FK를 강제하지 않은 경우가 있습니다. 신규·과거 코드 때문에 정책 수집 전체가 실패하지 않게 하기 위함입니다.
-- 최종 프로젝트 구조는 12개 테이블과 3개 조회용 View입니다.
+- 최종 프로젝트 구조는 13개 테이블과 3개 조회용 View입니다.
 
 ## 전체 구성
 
@@ -27,6 +27,7 @@
 | 채팅 | `chat_profile` | 대화방별 사용자 프로필 |
 | 채팅 | `chat_message` | 대화 메시지 |
 | 채팅 | `message_policy_ref` | 메시지와 근거 정책 연결 |
+| 채팅 | `chat_current_policy` | 대화방에서 현재 대화 중인 정책 목록 |
 | 조회 | `v_policy_region_resolved` | 정책 지역코드를 현재 지역으로 해석하는 View |
 | 조회 | `v_policy_region_scope` | 정책의 전국 범위를 공통 판정하는 View |
 | 조회 | `v_policy_sido_scope` | 정책별 시도 전체 범위를 판정하는 View |
@@ -332,9 +333,13 @@ RAG 문맥이나 UI에는 숫자 코드보다 `code_name`을 사용합니다. �
 | 컬럼 | 타입 | 용도 |
 | --- | --- | --- |
 | `room_id` | `UUID` | 대화방 식별자, PK |
+| `user_id` | `VARCHAR(100)` | 대화방 소유자. Spring이 넘기는 사용자 식별값 |
 | `title` | `VARCHAR(200)` | 대화방 제목 |
 | `created_at` | `TIMESTAMPTZ` | 생성 시각 |
-| `updated_at` | `TIMESTAMPTZ` | 마지막 갱신 시각 |
+| `updated_at` | `TIMESTAMPTZ` | 마지막 갱신 시각. 메시지를 저장할 때 함께 갱신 |
+
+- 사용자 테이블은 이 DB에 없어 `user_id`에는 FK를 두지 않습니다.
+- `(user_id, updated_at DESC)` 인덱스로 사용자별 대화방 목록을 최근 순으로 조회합니다.
 
 ---
 
@@ -371,9 +376,12 @@ RAG 문맥이나 UI에는 숫자 코드보다 `code_name`을 사용합니다. �
 | `room_id` | `UUID` | 메시지가 속한 대화방, `chat_room` FK |
 | `role` | `VARCHAR(20)` | 메시지 작성 주체 |
 | `content` | `TEXT` | 메시지 본문 |
+| `metadata` | `JSONB` | 답변 생성 정보(프롬프트 버전, 모델, 토큰), 질문 분석 결과, 버튼 입력 등. 기본값 `{}` |
 | `created_at` | `TIMESTAMPTZ` | 메시지 생성 시각 |
 
 `role`은 `user`, `assistant`, `system`, `tool`만 허용합니다.
+
+질문과 답변을 한 트랜잭션에 저장하면 `created_at`이 같으므로, 메시지 순서는 `message_id`로 보장합니다.
 
 ---
 
@@ -386,12 +394,34 @@ RAG 문맥이나 UI에는 숫자 코드보다 `code_name`을 사용합니다. �
 | `message_id` | `BIGINT` | 정책을 참조한 메시지, `chat_message` FK |
 | `policy_no` | `VARCHAR(30)` | 참조된 정책, `policy` FK |
 | `relevance_score` | `DOUBLE PRECISION` | 검색 또는 추천 관련도 점수 |
+| `display_order` | `SMALLINT` | 사용자에게 보여준 순서 (1부터) |
 
 ### 키와 활용
 
 - PK: `(message_id, policy_no)`
+- UNIQUE: `(message_id, display_order)`, `display_order >= 1`
 - `relevance_score`는 `-1.0`에서 `1.0` 사이 또는 `NULL`
 - 답변 근거 표시, 정책 링크 제공, 검색 품질 분석에 사용합니다.
+- "두 번째 거" 같은 지목은 점수 순서가 아니라 `display_order`를 기준으로 해석합니다.
+
+---
+
+## `chat_current_policy`
+
+**한 행의 의미:** 대화방 하나에서 지금 대화 중인 정책 하나.
+
+| 컬럼 | 타입 | 용도 |
+| --- | --- | --- |
+| `room_id` | `UUID` | 대상 대화방, `chat_room` FK |
+| `policy_no` | `VARCHAR(30)` | 대화 중인 정책, `policy` FK |
+| `display_order` | `SMALLINT` | 목록 안의 순서 (1부터) |
+
+### 키와 활용
+
+- PK: `(room_id, policy_no)`
+- UNIQUE: `(room_id, display_order)`, `display_order >= 1`
+- 정책 이름이 없는 후속 질문("소득 기준은?")의 기본 대상입니다.
+- 한 질문에서 여러 정책을 다룰 수 있어 목록으로 저장합니다. 이력은 남기지 않고 매 턴 현재 상태로 교체하며, 턴별 대상은 `chat_message.metadata`에 남깁니다.
 
 ---
 

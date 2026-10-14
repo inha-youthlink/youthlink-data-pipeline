@@ -129,6 +129,7 @@ erDiagram
 
     CHAT_ROOM {
         uuid room_id PK
+        varchar user_id
         varchar title
         timestamp created_at
         timestamp updated_at
@@ -154,6 +155,7 @@ erDiagram
         uuid room_id FK
         varchar role
         text content
+        jsonb metadata
         timestamp created_at
     }
 
@@ -161,6 +163,13 @@ erDiagram
         bigint message_id PK,FK
         varchar policy_no PK,FK
         float relevance_score
+        smallint display_order
+    }
+
+    CHAT_CURRENT_POLICY {
+        uuid room_id PK,FK
+        varchar policy_no PK,FK
+        smallint display_order
     }
 
     POLICY ||--o{ POLICY_REGION : "applies to"
@@ -174,6 +183,9 @@ erDiagram
 
     CHAT_MESSAGE ||--o{ MESSAGE_POLICY_REF : "references"
     POLICY ||--o{ MESSAGE_POLICY_REF : "referenced by"
+
+    CHAT_ROOM ||--o{ CHAT_CURRENT_POLICY : "focuses on"
+    POLICY ||--o{ CHAT_CURRENT_POLICY : "focused in"
 ```
 
 ## Table groups
@@ -195,6 +207,7 @@ erDiagram
 - `chat_profile`
 - `chat_message`
 - `message_policy_ref`
+- `chat_current_policy`
 
 ## 지역 코드 관계
 

@@ -279,10 +279,14 @@ CREATE INDEX IF NOT EXISTS idx_policy_chunk_embedding_hnsw
 
 CREATE TABLE IF NOT EXISTS chat_room (
     room_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         VARCHAR(100) NOT NULL,
     title           VARCHAR(200),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS idx_chat_room_user_updated
+    ON chat_room (user_id, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS chat_profile (
     room_id                 UUID PRIMARY KEY,
@@ -321,6 +325,7 @@ CREATE TABLE IF NOT EXISTS chat_message (
     room_id          UUID NOT NULL,
     role             VARCHAR(20) NOT NULL,
     content          TEXT NOT NULL,
+    metadata         JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
     CONSTRAINT fk_chat_message_room
@@ -339,6 +344,7 @@ CREATE TABLE IF NOT EXISTS message_policy_ref (
     message_id          BIGINT NOT NULL,
     policy_no           VARCHAR(30) NOT NULL,
     relevance_score     DOUBLE PRECISION,
+    display_order       SMALLINT NOT NULL,
 
     PRIMARY KEY (message_id, policy_no),
 
@@ -356,10 +362,40 @@ CREATE TABLE IF NOT EXISTS message_policy_ref (
         CHECK (
             relevance_score IS NULL
             OR (relevance_score >= -1.0 AND relevance_score <= 1.0)
-        )
+        ),
+
+    CONSTRAINT uq_message_policy_ref_order
+        UNIQUE (message_id, display_order),
+
+    CONSTRAINT chk_message_policy_ref_order
+        CHECK (display_order >= 1)
 );
 
 CREATE INDEX IF NOT EXISTS idx_message_policy_ref_policy
     ON message_policy_ref (policy_no);
+
+CREATE TABLE IF NOT EXISTS chat_current_policy (
+    room_id         UUID NOT NULL,
+    policy_no       VARCHAR(30) NOT NULL,
+    display_order   SMALLINT NOT NULL,
+
+    PRIMARY KEY (room_id, policy_no),
+
+    CONSTRAINT fk_chat_current_policy_room
+        FOREIGN KEY (room_id)
+        REFERENCES chat_room (room_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_chat_current_policy_policy
+        FOREIGN KEY (policy_no)
+        REFERENCES policy (policy_no)
+        ON DELETE CASCADE,
+
+    CONSTRAINT uq_chat_current_policy_order
+        UNIQUE (room_id, display_order),
+
+    CONSTRAINT chk_chat_current_policy_order
+        CHECK (display_order >= 1)
+);
 
 COMMIT;
