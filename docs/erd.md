@@ -156,6 +156,8 @@ erDiagram
         varchar role
         text content
         jsonb metadata
+        uuid client_message_id
+        bigint reply_to_message_id FK
         timestamp created_at
     }
 
@@ -172,6 +174,12 @@ erDiagram
         smallint display_order
     }
 
+    POLICY_SCRAP {
+        varchar user_id PK
+        varchar policy_no PK,FK
+        timestamp created_at
+    }
+
     POLICY ||--o{ POLICY_REGION : "applies to"
     POLICY ||--o{ POLICY_APPLICATION_PERIOD : "accepts applications during"
     REGION ||--o{ REGION_CODE_MAPPING : "canonical region"
@@ -180,12 +188,15 @@ erDiagram
 
     CHAT_ROOM ||--o| CHAT_PROFILE : "has"
     CHAT_ROOM ||--o{ CHAT_MESSAGE : "contains"
+    CHAT_MESSAGE |o--o{ CHAT_MESSAGE : "answered by"
 
     CHAT_MESSAGE ||--o{ MESSAGE_POLICY_REF : "references"
     POLICY ||--o{ MESSAGE_POLICY_REF : "referenced by"
 
     CHAT_ROOM ||--o{ CHAT_CURRENT_POLICY : "focuses on"
     POLICY ||--o{ CHAT_CURRENT_POLICY : "focused in"
+
+    POLICY ||--o{ POLICY_SCRAP : "scrapped as"
 ```
 
 ## Table groups
@@ -208,6 +219,7 @@ erDiagram
 - `chat_message`
 - `message_policy_ref`
 - `chat_current_policy`
+- `policy_scrap` (대화방이 아니라 사용자 단위 스크랩)
 
 ## 지역 코드 관계
 

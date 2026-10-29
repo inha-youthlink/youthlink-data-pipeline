@@ -326,6 +326,8 @@ CREATE TABLE IF NOT EXISTS chat_message (
     role             VARCHAR(20) NOT NULL,
     content          TEXT NOT NULL,
     metadata         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    client_message_id    UUID,
+    reply_to_message_id  BIGINT,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
     CONSTRAINT fk_chat_message_room
@@ -333,12 +335,24 @@ CREATE TABLE IF NOT EXISTS chat_message (
         REFERENCES chat_room (room_id)
         ON DELETE CASCADE,
 
+    CONSTRAINT fk_chat_message_reply_to
+        FOREIGN KEY (reply_to_message_id)
+        REFERENCES chat_message (message_id)
+        ON DELETE CASCADE,
+
     CONSTRAINT chk_chat_message_role
-        CHECK (role IN ('user', 'assistant', 'system', 'tool'))
+        CHECK (role IN ('user', 'assistant', 'system', 'tool')),
+
+    CONSTRAINT uq_chat_message_client_message_id
+        UNIQUE (room_id, client_message_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_chat_message_room_created
     ON chat_message (room_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_chat_message_reply_to
+    ON chat_message (reply_to_message_id)
+    WHERE reply_to_message_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS message_policy_ref (
     message_id          BIGINT NOT NULL,
@@ -396,6 +410,19 @@ CREATE TABLE IF NOT EXISTS chat_current_policy (
 
     CONSTRAINT chk_chat_current_policy_order
         CHECK (display_order >= 1)
+);
+
+CREATE TABLE IF NOT EXISTS policy_scrap (
+    user_id         VARCHAR(100) NOT NULL,
+    policy_no       VARCHAR(30) NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    PRIMARY KEY (user_id, policy_no),
+
+    CONSTRAINT fk_policy_scrap_policy
+        FOREIGN KEY (policy_no)
+        REFERENCES policy (policy_no)
+        ON DELETE CASCADE
 );
 
 COMMIT;
