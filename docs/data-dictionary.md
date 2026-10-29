@@ -9,7 +9,7 @@
 - **한 행의 의미**는 해당 테이블의 튜플(row) 하나가 무엇을 나타내는지 설명합니다.
 - `PK`는 기본키, `FK`는 외래키, `UNIQUE`는 중복 방지 제약조건입니다.
 - 외부 API 코드에는 의도적으로 FK를 강제하지 않은 경우가 있습니다. 신규·과거 코드 때문에 정책 수집 전체가 실패하지 않게 하기 위함입니다.
-- 최종 프로젝트 구조는 13개 테이블과 3개 조회용 View입니다.
+- 최종 프로젝트 구조는 14개 테이블과 3개 조회용 View입니다.
 
 ## 전체 구성
 
@@ -28,6 +28,7 @@
 | 채팅 | `chat_message` | 대화 메시지 |
 | 채팅 | `message_policy_ref` | 메시지와 근거 정책 연결 |
 | 채팅 | `chat_current_policy` | 대화방에서 현재 대화 중인 정책 목록 |
+| 채팅 | `policy_scrap` | 사용자별 스크랩한 정책 |
 | 조회 | `v_policy_region_resolved` | 정책 지역코드를 현재 지역으로 해석하는 View |
 | 조회 | `v_policy_region_scope` | 정책의 전국 범위를 공통 판정하는 View |
 | 조회 | `v_policy_sido_scope` | 정책별 시도 전체 범위를 판정하는 View |
@@ -333,7 +334,7 @@ RAG 문맥이나 UI에는 숫자 코드보다 `code_name`을 사용합니다. �
 | 컬럼 | 타입 | 용도 |
 | --- | --- | --- |
 | `room_id` | `UUID` | 대화방 식별자, PK |
-| `user_id` | `VARCHAR(100)` | 대화방 소유자. Spring이 넘기는 사용자 식별값 |
+| `user_id` | `VARCHAR(100)` | 대화방 소유자. 프론트가 브라우저마다 만드는 익명 ID(`X-Client-Id`, UUID) |
 | `title` | `VARCHAR(200)` | 대화방 제목 |
 | `created_at` | `TIMESTAMPTZ` | 생성 시각 |
 | `updated_at` | `TIMESTAMPTZ` | 마지막 갱신 시각. 메시지를 저장할 때 함께 갱신 |
@@ -377,11 +378,18 @@ RAG 문맥이나 UI에는 숫자 코드보다 `code_name`을 사용합니다. �
 | `role` | `VARCHAR(20)` | 메시지 작성 주체 |
 | `content` | `TEXT` | 메시지 본문 |
 | `metadata` | `JSONB` | 답변 생성 정보(프롬프트 버전, 모델, 토큰), 질문 분석 결과, 버튼 입력 등. 기본값 `{}` |
+| `client_message_id` | `UUID` | 질문에만 저장하는 프론트의 메시지 키. 재시도한 질문을 같은 질문으로 알아보는 데 사용 |
+| `reply_to_message_id` | `BIGINT` | 답변에만 저장하는 질문 메시지, `chat_message` FK |
 | `created_at` | `TIMESTAMPTZ` | 메시지 생성 시각 |
 
 `role`은 `user`, `assistant`, `system`, `tool`만 허용합니다.
 
-질문과 답변을 한 트랜잭션에 저장하면 `created_at`이 같으므로, 메시지 순서는 `message_id`로 보장합니다.
+### 키와 활용
+
+- UNIQUE: `(room_id, client_message_id)`. 키는 대화방 안에서만 유일하면 되고, 답변 행은 `NULL`이라 제약에 걸리지 않습니다.
+- 질문은 답변 생성 전에 저장하므로 연결이 끊기거나 생성이 실패하면 답변 없는 질문이 남습니다. 그래서 질문과 답변의 짝은 메시지 순서가 아니라 `reply_to_message_id`로 찾습니다.
+- 질문 하나에 답변 하나는 백엔드가 지킵니다. 답변 다시 생성 같은 기능을 막지 않도록 유일 제약은 두지 않습니다.
+- 메시지 순서는 `message_id`로 보장합니다. 009 이전 답변의 `reply_to_message_id`는 마이그레이션에서 바로 앞 질문으로 채웁니다.
 
 ---
 
@@ -422,6 +430,23 @@ RAG 문맥이나 UI에는 숫자 코드보다 `code_name`을 사용합니다. �
 - UNIQUE: `(room_id, display_order)`, `display_order >= 1`
 - 정책 이름이 없는 후속 질문("소득 기준은?")의 기본 대상입니다.
 - 한 질문에서 여러 정책을 다룰 수 있어 목록으로 저장합니다. 이력은 남기지 않고 매 턴 현재 상태로 교체하며, 턴별 대상은 `chat_message.metadata`에 남깁니다.
+
+---
+
+## `policy_scrap`
+
+**한 행의 의미:** 사용자 한 명이 정책 하나를 스크랩했다는 기록.
+
+| 컬럼 | 타입 | 용도 |
+| --- | --- | --- |
+| `user_id` | `VARCHAR(100)` | 스크랩한 사용자. `chat_room.user_id`와 같은 익명 ID |
+| `policy_no` | `VARCHAR(30)` | 스크랩한 정책, `policy` FK |
+| `created_at` | `TIMESTAMPTZ` | 스크랩한 시각 |
+
+### 키와 활용
+
+- PK: `(user_id, policy_no)`. 같은 정책을 다시 스크랩해도 한 행만 남고, 사용자별 목록도 이 키로 조회합니다.
+- 스크랩은 대화방이 아니라 사용자 단위라 `chat_room`과 연결하지 않습니다. 사용자 테이블이 없어 `user_id`에는 FK를 두지 않습니다.
 
 ---
 
