@@ -7,6 +7,8 @@ from etl.embedding_utils import (
     suggested_retry_delay,
     vector_literal,
 )
+from etl.embed_policy_chunks import load_candidates
+from etl.embed_policy_web_chunks import load_candidates as load_web_candidates
 from etl.search_policy_chunks import search_chunks
 
 
@@ -108,6 +110,46 @@ class EmbeddingUtilsTests(unittest.TestCase):
 
 
 class VectorSearchTests(unittest.TestCase):
+    def test_embedding_candidates_exclude_inactive_policies(self):
+        cursor = FakeCursor([])
+        conn = FakeConnection(cursor)
+
+        candidates, estimated_tokens = load_candidates(
+            conn,
+            encoder=object(),
+            model="test-model",
+            limit=None,
+            retry_errors=False,
+            force=False,
+        )
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(estimated_tokens, 0)
+        self.assertIn("JOIN policy p ON p.policy_no = pc.policy_no", cursor.sql)
+        self.assertIn("p.is_active = TRUE", cursor.sql)
+        self.assertIn("pc.embedding IS NULL", cursor.sql)
+
+    def test_web_embedding_candidates_use_only_verified_separate_corpus(self):
+        cursor = FakeCursor([])
+        conn = FakeConnection(cursor)
+
+        candidates, estimated_tokens = load_web_candidates(
+            conn,
+            encoder=object(),
+            model="test-model",
+            policy_nos=["P1"],
+            limit=None,
+            retry_errors=False,
+            force=False,
+        )
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(estimated_tokens, 0)
+        self.assertIn("FROM policy_web_chunk AS chunk", cursor.sql)
+        self.assertIn("JOIN v_verified_policy_web_chunk AS verified", cursor.sql)
+        self.assertIn("verified.policy_no = ANY(%s)", cursor.sql)
+        self.assertNotIn("FROM policy_chunk", cursor.sql)
+
     def test_search_uses_cosine_operator_and_candidate_filters(self):
         cursor = FakeCursor(
             [
@@ -133,6 +175,7 @@ class VectorSearchTests(unittest.TestCase):
 
         self.assertEqual(len(rows), 1)
         self.assertIn("pc.embedding <=> %s::vector", cursor.sql)
+        self.assertIn("p.is_active = TRUE", cursor.sql)
         self.assertEqual(cursor.params[1:4], ["test-model", ["P1"], ["SUPPORT"]])
         self.assertEqual(cursor.params[-1], 5)
         self.assertEqual(cursor.params[0], cursor.params[-2])

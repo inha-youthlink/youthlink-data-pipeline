@@ -4,7 +4,11 @@
 
 ## 1. 목적
 
-`policy_chunk.content`를 OpenAI `text-embedding-3-small`의 1536차원 벡터로 변환해 같은 행의 `embedding`에 저장하고, 사용자 질문 벡터와 cosine similarity를 비교합니다.
+활성 정책의 API 기반 `policy_chunk.content`를 OpenAI `text-embedding-3-small`의 1536차원 벡터로 변환해 같은 행의 `embedding`에 저장하고, 사용자 질문 벡터와 cosine similarity를 비교합니다. 이 문서의 기본 파이프라인은 온통청년 API 원천 전용입니다.
+
+크롤링 원문은 `policy_chunk`에 합치지 않습니다. 검증된 원문은 별도 `policy_web_chunk`에 생성하고 `etl/embed_policy_web_chunks.py`로 별도 임베딩합니다. RAG는 API 검색을 먼저 수행하고 부족할 때만 같은 `policy_no` 범위의 `v_verified_policy_web_chunk`를 fallback으로 조회합니다.
+
+`policy.is_active = false`인 정책은 새 임베딩 후보와 검색 결과에서 제외합니다. 이력과 재활성화를 위해 기존 청크·벡터는 삭제하지 않으며, 활성 여부만 바뀐 경우 전체 임베딩을 다시 생성할 필요가 없습니다.
 
 공식 참고 문서:
 
@@ -114,7 +118,7 @@ python etl/search_policy_chunks.py \
   --chunk-type APPLICATION
 ```
 
-검색 SQL은 pgvector cosine distance 연산자 `<=>`를 사용하고 다음과 같이 유사도로 변환합니다.
+검색 SQL은 활성 정책만 대상으로 pgvector cosine distance 연산자 `<=>`를 사용하고 다음과 같이 유사도로 변환합니다.
 
 ```sql
 1 - (embedding <=> query_embedding)

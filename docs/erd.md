@@ -5,6 +5,21 @@ PostgreSQL + pgvector 기반 프로토타입 데이터베이스 구조입니다.
 ```mermaid
 erDiagram
 
+    POLICY_SYNC_JOB {
+        uuid sync_job_id PK
+        varchar source
+        varchar status
+        integer api_total_count
+        integer processed_count
+        integer success_count
+        integer failed_count
+        integer deactivated_count
+        boolean full_scan_completed
+        boolean deactivation_applied
+        timestamp started_at
+        timestamp finished_at
+    }
+
     POLICY {
         varchar policy_no PK
         varchar policy_name
@@ -68,6 +83,9 @@ erDiagram
         timestamp source_created_at
         timestamp source_updated_at
         timestamp synced_at
+        boolean is_active
+        timestamp deactivated_at
+        uuid last_seen_sync_job_id FK
 
         jsonb raw_data
     }
@@ -127,6 +145,62 @@ erDiagram
         timestamp created_at
     }
 
+    WEB_SOURCE {
+        uuid source_id PK
+        text canonical_url UK
+        varchar host
+        varchar fetch_status
+        text final_url
+        integer http_status
+        timestamp last_success_at
+    }
+
+    POLICY_WEB_SOURCE {
+        varchar policy_no PK,FK
+        uuid source_id PK,FK
+        varchar relation_type PK
+        boolean is_active
+        varchar validation_status
+        decimal validation_score
+        uuid validated_document_id FK
+        jsonb matched_signals
+        jsonb conflicting_signals
+    }
+
+    WEB_DOCUMENT {
+        uuid document_id PK
+        uuid source_id FK
+        text title
+        text extracted_text
+        varchar content_hash
+        varchar extraction_version
+        boolean is_current
+        timestamp fetched_at
+    }
+
+    POLICY_ENRICHMENT_FACT {
+        uuid fact_id PK
+        varchar policy_no FK
+        uuid document_id FK
+        varchar field_name
+        jsonb value_json
+        text evidence_text
+        varchar validation_status
+        varchar extractor_version
+    }
+
+    POLICY_WEB_CHUNK {
+        uuid web_chunk_id PK
+        varchar policy_no FK
+        uuid document_id FK
+        integer chunk_index
+        varchar chunk_type
+        text content
+        varchar content_hash
+        varchar chunker_version
+        vector embedding
+    }
+
     CHAT_ROOM {
         uuid room_id PK
         varchar user_id
@@ -180,11 +254,20 @@ erDiagram
         timestamp created_at
     }
 
+    POLICY_SYNC_JOB o|--o{ POLICY : "last saw"
     POLICY ||--o{ POLICY_REGION : "applies to"
     POLICY ||--o{ POLICY_APPLICATION_PERIOD : "accepts applications during"
     REGION ||--o{ REGION_CODE_MAPPING : "canonical region"
     POLICY ||--o{ POLICY_ELIGIBILITY_CODE : "has condition"
     POLICY ||--o{ POLICY_CHUNK : "chunked into"
+    POLICY ||--o{ POLICY_WEB_SOURCE : "links to source"
+    WEB_SOURCE ||--o{ POLICY_WEB_SOURCE : "linked from policy"
+    WEB_SOURCE ||--o{ WEB_DOCUMENT : "versioned as"
+    WEB_DOCUMENT o|--o{ POLICY_WEB_SOURCE : "validated against"
+    POLICY ||--o{ POLICY_ENRICHMENT_FACT : "has separate web evidence"
+    WEB_DOCUMENT ||--o{ POLICY_ENRICHMENT_FACT : "supports fact"
+    POLICY ||--o{ POLICY_WEB_CHUNK : "scopes fallback"
+    WEB_DOCUMENT ||--o{ POLICY_WEB_CHUNK : "chunked separately"
 
     CHAT_ROOM ||--o| CHAT_PROFILE : "has"
     CHAT_ROOM ||--o{ CHAT_MESSAGE : "contains"
@@ -202,6 +285,7 @@ erDiagram
 ## Table groups
 
 ### Policy domain
+- `policy_sync_job`
 - `policy`
 - `policy_application_period`
 - `policy_region`
@@ -212,6 +296,13 @@ erDiagram
 
 ### RAG domain
 - `policy_chunk`
+
+### Web-source staging and verification domain
+- `web_source`
+- `policy_web_source`
+- `web_document`
+- `policy_enrichment_fact`
+- `policy_web_chunk`
 
 ### Chat domain
 - `chat_room`
@@ -282,3 +373,39 @@ flowchart LR
 ```
 
 `v_policy_region_scope`는 정책당 한 행으로 전국 범위를 판정합니다. `v_policy_sido_scope`는 정책·시도별 한 행으로 해당 시도의 전체 시군구를 포함하는지 판정합니다. RAG와 백엔드가 이 View를 함께 사용하면 `전국`, `{시도명} 전체` 계산이 서로 달라지는 문제를 피할 수 있습니다.
+
+## 검증형 정책 원문 흐름
+
+원문 테이블은 수집 staging과 사용 승인을 분리합니다. `web_document`에 본문이 저장되어도 정책-URL 관계가 `VERIFIED`가 아니면 검증 View에 나타나지 않습니다. 개별 관측 사실은 관계와 사실이 모두 검증되어야 노출됩니다. 크롤링 텍스트는 API 기반 `policy_chunk`와 합치지 않고 `policy_web_chunk`에 별도로 저장합니다.
+
+```mermaid
+flowchart LR
+    POLICY["policy<br/>활성 정책·API URL"]
+    SOURCE["web_source<br/>정규화 URL·수집 상태"]
+    LINK["policy_web_source<br/>PENDING / VERIFIED / REVIEW_REQUIRED<br/>REJECTED / LINK_ONLY"]
+    DOC["web_document<br/>버전별 staging 본문"]
+    FACT["policy_enrichment_fact<br/>값·직접 근거·검증 상태"]
+    WEB_CHUNK["policy_web_chunk<br/>별도 fallback 청크·벡터"]
+    VERIFIED_DOC["v_verified_policy_web_document<br/>검증된 최신 원문"]
+    VERIFIED_FACT["v_verified_policy_enrichment<br/>검증된 보강 사실"]
+    VERIFIED_CHUNK["v_verified_policy_web_chunk<br/>검증된 fallback 청크"]
+
+    POLICY --> LINK
+    SOURCE --> LINK
+    SOURCE --> DOC
+    DOC --> FACT
+    DOC --> WEB_CHUNK
+    POLICY --> FACT
+    POLICY --> WEB_CHUNK
+
+    LINK -->|"활성 + VERIFIED"| VERIFIED_DOC
+    DOC -->|"is_current + validated_document_id 일치"| VERIFIED_DOC
+    LINK -->|"활성 + VERIFIED"| VERIFIED_FACT
+    DOC -->|"is_current"| VERIFIED_FACT
+    FACT -->|"VERIFIED"| VERIFIED_FACT
+    LINK -->|"활성 + VERIFIED"| VERIFIED_CHUNK
+    DOC -->|"현재 검증 문서"| VERIFIED_CHUNK
+    WEB_CHUNK --> VERIFIED_CHUNK
+```
+
+RAG·백엔드는 staging 테이블을 직접 읽지 않고 검증 View를 사용합니다. 정책-URL 판정은 `validated_document_id`로 검사한 문서 버전에 고정되므로 같은 URL의 내용이 바뀌면 이전 승인이 새 본문에 자동 적용되지 않습니다. RAG는 API 기반 `policy_chunk`를 1차로 검색하고 정보가 부족할 때만 같은 `policy_no`의 `v_verified_policy_web_chunk`를 2차 fallback으로 사용합니다. `policy`와 `policy_chunk`는 크롤링 파이프라인이 수정하지 않습니다.

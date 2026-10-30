@@ -47,7 +47,11 @@ def search_chunks(
     chunk_types: Sequence[str] = (),
 ) -> list[dict[str, Any]]:
     vector = vector_literal(query_vector, DEFAULT_EMBEDDING_DIMENSIONS)
-    conditions = ["pc.embedding IS NOT NULL", "pc.embedding_model = %s"]
+    conditions = [
+        "p.is_active = TRUE",
+        "pc.embedding IS NOT NULL",
+        "pc.embedding_model = %s",
+    ]
     params: list[Any] = [model]
     if policy_nos:
         conditions.append("pc.policy_no = ANY(%s)")

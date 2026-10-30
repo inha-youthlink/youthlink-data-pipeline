@@ -366,7 +366,10 @@ def _load_policies(
     policy_nos: Sequence[str],
     limit: int | None,
 ) -> list[dict[str, Any]]:
-    conditions: list[str] = []
+    # Inactive policies are retained for audit/history, but must not produce
+    # new RAG chunks. Existing chunks are intentionally left untouched so a
+    # later reactivation can reuse them until the normal hash comparison runs.
+    conditions: list[str] = ["is_active = TRUE"]
     params: list[Any] = []
     if policy_nos:
         conditions.append("policy_no = ANY(%s)")

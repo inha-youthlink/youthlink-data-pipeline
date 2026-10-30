@@ -4,10 +4,13 @@ import argparse
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Iterable
+from uuid import UUID
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -31,6 +34,14 @@ DB_DSN = os.getenv(
 )
 
 DEFAULT_PAGE_SIZE = int(os.getenv("YOUTH_API_PAGE_SIZE", "100"))
+DEFAULT_REQUEST_DELAY_SECONDS = float(
+    os.getenv("YOUTH_API_REQUEST_DELAY_SECONDS", "1")
+)
+DEFAULT_MAX_ATTEMPTS = int(os.getenv("YOUTH_API_MAX_ATTEMPTS", "3"))
+DEFAULT_RETRY_BASE_DELAY_SECONDS = float(
+    os.getenv("YOUTH_API_RETRY_BASE_DELAY_SECONDS", "1")
+)
+MAX_RETRY_DELAY_SECONDS = 30.0
 
 
 # ============================================================
@@ -429,7 +440,11 @@ def build_policy_upsert_sql() -> str:
 POLICY_UPSERT_SQL = build_policy_upsert_sql()
 
 
-def load_policy(cur: psycopg.Cursor, record: PolicyRecord) -> None:
+def load_policy(
+    cur: psycopg.Cursor,
+    record: PolicyRecord,
+    sync_job_id: UUID | None = None,
+) -> None:
     """
     Idempotent per-policy load:
       1) UPSERT policy
@@ -440,6 +455,20 @@ def load_policy(cur: psycopg.Cursor, record: PolicyRecord) -> None:
     cur.execute(POLICY_UPSERT_SQL, record.policy)
 
     policy_no = record.policy["policy_no"]
+
+    # Only a full Youth API sync owns lifecycle state. Local JSON imports and
+    # period backfills must not accidentally reactivate/deactivate policies.
+    if sync_job_id is not None:
+        cur.execute(
+            """
+            UPDATE policy
+            SET is_active = TRUE,
+                deactivated_at = NULL,
+                last_seen_sync_job_id = %s
+            WHERE policy_no = %s
+            """,
+            (sync_job_id, policy_no),
+        )
 
     cur.execute(
         "DELETE FROM policy_application_period WHERE policy_no = %s",
@@ -594,8 +623,64 @@ def validate_page_size(page_size: int) -> int:
     return page_size
 
 
-def fetch_page(page_num: int, page_size: int = DEFAULT_PAGE_SIZE) -> dict[str, Any]:
+def validate_non_negative_delay(delay_seconds: float, name: str) -> float:
+    if delay_seconds < 0:
+        raise ValueError(f"{name} must not be negative")
+    return delay_seconds
+
+
+def validate_max_attempts(max_attempts: int) -> int:
+    if max_attempts <= 0:
+        raise ValueError("max attempts must be a positive integer")
+    return max_attempts
+
+
+def retry_delay_seconds(
+    retry_after: str | None,
+    attempt: int,
+    base_delay_seconds: float,
+) -> float:
+    """Return a bounded retry delay, preferring a valid Retry-After value."""
+    delay: float | None = None
+
+    if retry_after:
+        try:
+            delay = float(retry_after.strip())
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                delay = (
+                    retry_at - datetime.now(timezone.utc)
+                ).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                delay = None
+
+    if delay is None:
+        delay = base_delay_seconds * (2 ** max(attempt - 1, 0))
+
+    return min(MAX_RETRY_DELAY_SECONDS, max(0.0, delay))
+
+
+def wait_before_next_page(
+    delay_seconds: float = DEFAULT_REQUEST_DELAY_SECONDS,
+) -> None:
+    validate_non_negative_delay(delay_seconds, "request delay")
+    if delay_seconds:
+        time.sleep(delay_seconds)
+
+
+def fetch_page(
+    page_num: int,
+    page_size: int = DEFAULT_PAGE_SIZE,
+    *,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    retry_base_delay_seconds: float = DEFAULT_RETRY_BASE_DELAY_SECONDS,
+) -> dict[str, Any]:
     validate_page_size(page_size)
+    validate_max_attempts(max_attempts)
+    validate_non_negative_delay(retry_base_delay_seconds, "retry base delay")
 
     if not API_URL:
         raise RuntimeError("YOUTH_API_URL is not set")
@@ -610,9 +695,63 @@ def fetch_page(page_num: int, page_size: int = DEFAULT_PAGE_SIZE) -> dict[str, A
         "rtnType": "json",
     }
 
-    response = requests.get(API_URL, params=params, timeout=30)
-    response.raise_for_status()
-    return response.json()
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.get(API_URL, params=params, timeout=30)
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt < max_attempts:
+                time.sleep(
+                    retry_delay_seconds(
+                        None,
+                        attempt,
+                        retry_base_delay_seconds,
+                    )
+                )
+                continue
+            raise RuntimeError(
+                f"Youth API page {page_num} failed after "
+                f"{max_attempts} attempts: network error"
+            ) from None
+        except requests.RequestException:
+            # Requests exceptions can include the prepared URL and therefore
+            # the apiKeyNm query parameter. Never propagate the original text.
+            raise RuntimeError(
+                f"Youth API page {page_num} failed: request error"
+            ) from None
+
+        status_code = response.status_code
+        if 200 <= status_code < 300:
+            try:
+                payload = response.json()
+            except (ValueError, requests.RequestException):
+                # JSON decoder errors may also retain response/request details.
+                raise RuntimeError(
+                    f"Youth API page {page_num} returned invalid JSON"
+                ) from None
+            if not isinstance(payload, dict):
+                raise RuntimeError(
+                    f"Youth API page {page_num} returned invalid JSON"
+                ) from None
+            return payload
+
+        retryable_status = status_code == 429 or 500 <= status_code <= 599
+        if retryable_status and attempt < max_attempts:
+            time.sleep(
+                retry_delay_seconds(
+                    response.headers.get("Retry-After"),
+                    attempt,
+                    retry_base_delay_seconds,
+                )
+            )
+            continue
+
+        # 403 and all other non-retryable statuses fail immediately. Do not
+        # use response.raise_for_status(): its exception includes the full URL.
+        raise RuntimeError(
+            f"Youth API page {page_num} failed with HTTP {status_code}"
+        ) from None
+
+    raise AssertionError("unreachable")
 
 
 def extract_page(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
@@ -655,6 +794,136 @@ def extract_page(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
     return items, total_count
 
 
+def create_sync_job(conn: psycopg.Connection, page_size: int) -> UUID:
+    """Persist the job before fetching pages so failures remain observable."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO policy_sync_job (
+                source,
+                status,
+                page_size
+            )
+            VALUES ('YOUTH_API', 'RUNNING', %s)
+            RETURNING sync_job_id
+            """,
+            (page_size,),
+        )
+        row = cur.fetchone()
+    conn.commit()
+
+    if row is None:
+        raise RuntimeError("failed to create policy sync job")
+    return row[0]
+
+
+def evaluate_full_sync(
+    *,
+    full_scan_completed: bool,
+    api_total_count: int | None,
+    totals_consistent: bool,
+    processed_count: int,
+    success_count: int,
+    failed_count: int,
+    unique_success_count: int,
+) -> tuple[bool, str | None]:
+    """
+    Decide whether it is safe to mark unseen policies inactive.
+
+    This intentionally prefers leaving stale rows active over deactivating a
+    valid policy after a truncated, duplicated, empty, or partially failed API
+    response.
+    """
+    reasons: list[str] = []
+
+    if not full_scan_completed:
+        reasons.append("API pagination did not reach a normal end")
+    if api_total_count is None or api_total_count <= 0:
+        reasons.append("API total count is missing or empty")
+    if not totals_consistent:
+        reasons.append("API total count changed between pages")
+    if failed_count:
+        reasons.append(f"{failed_count} policies failed to load")
+    if api_total_count is not None and processed_count != api_total_count:
+        reasons.append(
+            f"processed count {processed_count} != API total {api_total_count}"
+        )
+    if api_total_count is not None and success_count != api_total_count:
+        reasons.append(
+            f"success count {success_count} != API total {api_total_count}"
+        )
+    if unique_success_count != success_count:
+        reasons.append(
+            f"unique policy count {unique_success_count} != success count "
+            f"{success_count}"
+        )
+
+    return not reasons, "; ".join(reasons) or None
+
+
+def finish_sync_job(
+    conn: psycopg.Connection,
+    sync_job_id: UUID,
+    *,
+    status: str,
+    api_total_count: int | None,
+    processed_count: int,
+    success_count: int,
+    failed_count: int,
+    deactivated_count: int,
+    full_scan_completed: bool,
+    deactivation_applied: bool,
+    error_message: str | None,
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE policy_sync_job
+            SET status = %s,
+                api_total_count = %s,
+                processed_count = %s,
+                success_count = %s,
+                failed_count = %s,
+                deactivated_count = %s,
+                full_scan_completed = %s,
+                deactivation_applied = %s,
+                finished_at = NOW(),
+                error_message = %s
+            WHERE sync_job_id = %s
+            """,
+            (
+                status,
+                api_total_count,
+                processed_count,
+                success_count,
+                failed_count,
+                deactivated_count,
+                full_scan_completed,
+                deactivation_applied,
+                error_message,
+                sync_job_id,
+            ),
+        )
+
+
+def deactivate_unseen_policies(
+    cur: psycopg.Cursor,
+    sync_job_id: UUID,
+) -> int:
+    """Soft-delete policies not observed by a verified complete API sync."""
+    cur.execute(
+        """
+        UPDATE policy
+        SET is_active = FALSE,
+            deactivated_at = COALESCE(deactivated_at, NOW())
+        WHERE is_active = TRUE
+          AND last_seen_sync_job_id IS DISTINCT FROM %s
+        """,
+        (sync_job_id,),
+    )
+    return cur.rowcount
+
+
 def run_api_etl(page_size: int = DEFAULT_PAGE_SIZE) -> tuple[int, int]:
     validate_page_size(page_size)
 
@@ -662,60 +931,142 @@ def run_api_etl(page_size: int = DEFAULT_PAGE_SIZE) -> tuple[int, int]:
     failed_count = 0
     processed_count = 0
     page_num = 1
+    api_total_count: int | None = None
+    totals_consistent = True
+    full_scan_completed = False
+    successful_policy_nos: set[str] = set()
 
     with psycopg.connect(DB_DSN) as conn:
+        sync_job_id = create_sync_job(conn, page_size)
 
-        while True:
-            payload = fetch_page(page_num, page_size)
-            items, total_count = extract_page(payload)
+        try:
+            while True:
+                payload = fetch_page(page_num, page_size)
+                items, total_count = extract_page(payload)
 
-            if not items:
-                break
+                # An empty page is a normal terminator only after it has been
+                # validated by the completion guard below. Ignore its fallback
+                # total_count=0 when a prior non-empty page reported a total.
+                if items:
+                    if api_total_count is None:
+                        api_total_count = total_count
+                    elif total_count != api_total_count:
+                        totals_consistent = False
+                elif api_total_count is None:
+                    api_total_count = total_count
 
-            with conn.transaction():
+                if not items:
+                    full_scan_completed = True
+                    break
 
-                for item in items:
-                    try:
-                        with conn.transaction():
-                            with conn.cursor() as cur:
-                                record = transform_policy(item)
-                                load_policy(cur, record)
+                with conn.transaction():
+                    for item in items:
+                        try:
+                            with conn.transaction():
+                                with conn.cursor() as cur:
+                                    record = transform_policy(item)
+                                    load_policy(cur, record, sync_job_id)
 
-                        success_count += 1
+                            success_count += 1
+                            successful_policy_nos.add(record.policy["policy_no"])
 
-                    except Exception as e:
-                        failed_count += 1
-                        log_failed_policy(
-                            item=item,
-                            error=e,
-                            page_num=page_num,
-                        )
+                        except Exception as e:
+                            failed_count += 1
+                            log_failed_policy(
+                                item=item,
+                                error=e,
+                                page_num=page_num,
+                            )
 
-                        print(
-                            f"[FAILED] "
-                            f"page={page_num} "
-                            f"policy_no={item.get('plcyNo')} "
-                            f"name={item.get('plcyNm')} "
-                            f"error={type(e).__name__}"
-                        )
+                            print(
+                                f"[FAILED] "
+                                f"page={page_num} "
+                                f"policy_no={item.get('plcyNo')} "
+                                f"name={item.get('plcyNm')} "
+                                f"error={type(e).__name__}"
+                            )
 
-                    finally:
-                        processed_count += 1
+                        finally:
+                            processed_count += 1
 
-            print(
-                f"[page {page_num}] "
-                f"processed={len(items)} "
-                f"success={success_count} "
-                f"failed={failed_count} "
-                f"processed_total={processed_count} "
-                f"api_total={total_count}"
+                print(
+                    f"[page {page_num}] "
+                    f"processed={len(items)} "
+                    f"success={success_count} "
+                    f"failed={failed_count} "
+                    f"processed_total={processed_count} "
+                    f"api_total={total_count}"
+                )
+
+                # 마지막 페이지 판별
+                if len(items) < page_size:
+                    full_scan_completed = True
+                    break
+
+                wait_before_next_page()
+                page_num += 1
+
+            is_complete, completion_error = evaluate_full_sync(
+                full_scan_completed=full_scan_completed,
+                api_total_count=api_total_count,
+                totals_consistent=totals_consistent,
+                processed_count=processed_count,
+                success_count=success_count,
+                failed_count=failed_count,
+                unique_success_count=len(successful_policy_nos),
             )
 
-            # 마지막 페이지 판별
-            if len(items) < page_size:
-                break
+            deactivated_count = 0
+            with conn.transaction():
+                if is_complete:
+                    with conn.cursor() as cur:
+                        deactivated_count = deactivate_unseen_policies(
+                            cur,
+                            sync_job_id,
+                        )
 
-            page_num += 1
+                finish_sync_job(
+                    conn,
+                    sync_job_id,
+                    status="SUCCEEDED" if is_complete else "PARTIAL",
+                    api_total_count=api_total_count,
+                    processed_count=processed_count,
+                    success_count=success_count,
+                    failed_count=failed_count,
+                    deactivated_count=deactivated_count,
+                    full_scan_completed=full_scan_completed,
+                    deactivation_applied=is_complete,
+                    error_message=completion_error,
+                )
+
+            if is_complete:
+                print(
+                    f"sync_job={sync_job_id} completed; "
+                    f"deactivated={deactivated_count}"
+                )
+            else:
+                print(
+                    f"sync_job={sync_job_id} partial; "
+                    f"deactivation skipped: {completion_error}"
+                )
+
+        except Exception as error:
+            conn.rollback()
+            with conn.transaction():
+                finish_sync_job(
+                    conn,
+                    sync_job_id,
+                    status="FAILED",
+                    api_total_count=api_total_count,
+                    processed_count=processed_count,
+                    success_count=success_count,
+                    failed_count=failed_count,
+                    deactivated_count=0,
+                    full_scan_completed=False,
+                    deactivation_applied=False,
+                    error_message=f"{type(error).__name__}: {error}",
+                )
+            raise
 
     return success_count, failed_count
 

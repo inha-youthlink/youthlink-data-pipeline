@@ -70,22 +70,28 @@ def load_candidates(
     retry_errors: bool,
     force: bool,
 ) -> tuple[list[Candidate], int]:
-    conditions: list[str] = []
+    # Policy rows are soft-deleted with is_active rather than physically
+    # removed. Keep their existing vectors, but never spend API tokens creating
+    # or refreshing embeddings that cannot appear in retrieval results.
+    conditions: list[str] = ["p.is_active = TRUE"]
     params: list[Any] = []
 
     if not force:
-        conditions.append("(embedding IS NULL OR embedding_model IS DISTINCT FROM %s)")
+        conditions.append(
+            "(pc.embedding IS NULL OR pc.embedding_model IS DISTINCT FROM %s)"
+        )
         params.append(model)
     if not retry_errors and not force:
-        conditions.append("embedding_error IS NULL")
+        conditions.append("pc.embedding_error IS NULL")
 
     sql = """
-        SELECT chunk_id, policy_no, chunk_type, content
-        FROM policy_chunk
+        SELECT pc.chunk_id, pc.policy_no, pc.chunk_type, pc.content
+        FROM policy_chunk pc
+        JOIN policy p ON p.policy_no = pc.policy_no
     """
     if conditions:
         sql += " WHERE " + " AND ".join(conditions)
-    sql += " ORDER BY policy_no, chunk_index"
+    sql += " ORDER BY pc.policy_no, pc.chunk_index"
     if limit is not None:
         sql += " LIMIT %s"
         params.append(limit)

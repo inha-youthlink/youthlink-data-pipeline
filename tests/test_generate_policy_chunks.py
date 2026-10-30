@@ -3,12 +3,52 @@ from datetime import date
 
 from etl.generate_policy_chunks import (
     CHUNKER_VERSION,
+    _load_policies,
     build_policy_chunks,
     build_region_catalog,
     compress_regions,
     content_hash,
     normalize_text,
 )
+
+
+class RecordingCursor:
+    def __init__(self):
+        self.sql = None
+        self.params = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def execute(self, sql, params):
+        self.sql = sql
+        self.params = params
+
+    def fetchall(self):
+        return []
+
+
+class RecordingConnection:
+    def __init__(self):
+        self.recording_cursor = RecordingCursor()
+
+    def cursor(self, **kwargs):
+        return self.recording_cursor
+
+
+class PolicySelectionTests(unittest.TestCase):
+    def test_chunk_generation_selects_only_active_policies(self):
+        conn = RecordingConnection()
+
+        rows = _load_policies(conn, ["P1"], 10)
+
+        self.assertEqual(rows, [])
+        self.assertIn("is_active = TRUE", conn.recording_cursor.sql)
+        self.assertIn("policy_no = ANY(%s)", conn.recording_cursor.sql)
+        self.assertEqual(conn.recording_cursor.params, [["P1"], 10])
 
 
 class NormalizeTextTests(unittest.TestCase):
