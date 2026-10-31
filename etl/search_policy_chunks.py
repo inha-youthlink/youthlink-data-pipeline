@@ -12,7 +12,7 @@ try:
     from .embedding_utils import (
         DEFAULT_EMBEDDING_DIMENSIONS,
         DEFAULT_EMBEDDING_MODEL,
-        create_openai_client,
+        create_embedding_client,
         request_embeddings,
         vector_literal,
     )
@@ -20,7 +20,7 @@ except ImportError:  # Direct execution: python etl/search_policy_chunks.py
     from embedding_utils import (
         DEFAULT_EMBEDDING_DIMENSIONS,
         DEFAULT_EMBEDDING_MODEL,
-        create_openai_client,
+        create_embedding_client,
         request_embeddings,
         vector_literal,
     )
@@ -34,8 +34,9 @@ DB_DSN = os.getenv(
     "postgresql://postgres:postgres@localhost:5432/youthlink",
 )
 EMBEDDING_MODEL = os.getenv(
-    "OPENAI_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL
+    "LITELLM_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL
 ).strip()
+EMBEDDING_API_BASE_URL = os.getenv("LITELLM_BASE_URL", "").strip()
 
 
 def search_chunks(
@@ -116,11 +117,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    api_key = os.getenv("LITELLM_API_KEY", "").strip()
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is required to embed the search query")
+        raise RuntimeError(
+            "LITELLM_API_KEY is required to embed the search query"
+        )
+    if not EMBEDDING_API_BASE_URL:
+        raise RuntimeError(
+            "LITELLM_BASE_URL is required to embed the search query"
+        )
 
-    client = create_openai_client(api_key)
+    client = create_embedding_client(api_key, EMBEDDING_API_BASE_URL)
     vectors, _ = request_embeddings(
         client,
         [args.query],

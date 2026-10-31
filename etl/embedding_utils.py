@@ -3,18 +3,36 @@ from __future__ import annotations
 import math
 import re
 from typing import Any, Sequence
+from urllib.parse import urlsplit
 
 
-DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
-DEFAULT_EMBEDDING_DIMENSIONS = 1536
-TOKEN_ENCODING = "cl100k_base"
+DEFAULT_EMBEDDING_MODEL = "bedrock-titan-embed-v2"
+DEFAULT_EMBEDDING_DIMENSIONS = 1024
 _RETRY_SECONDS_RE = re.compile(
     r"try again in\s+([0-9]+(?:\.[0-9]+)?)\s*(ms|s)",
     re.IGNORECASE,
 )
 
 
-def create_openai_client(api_key: str, timeout: float = 60.0) -> Any:
+def create_embedding_client(
+    api_key: str,
+    base_url: str,
+    timeout: float = 60.0,
+) -> Any:
+    """Create an OpenAI-compatible client for the configured LiteLLM gateway."""
+    api_key = api_key.strip()
+    base_url = base_url.strip()
+    if not api_key:
+        raise ValueError("embedding gateway API key must not be blank")
+    try:
+        parsed = urlsplit(base_url)
+    except ValueError as exc:
+        raise ValueError("embedding gateway base URL is invalid") from exc
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError(
+            "embedding gateway base URL must be an absolute HTTPS URL"
+        )
+
     try:
         from openai import OpenAI
     except ImportError as exc:
@@ -23,22 +41,24 @@ def create_openai_client(api_key: str, timeout: float = 60.0) -> Any:
             "python -m pip install -r requirements.txt"
         ) from exc
 
-    return OpenAI(api_key=api_key, timeout=timeout, max_retries=0)
+    return OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=timeout,
+        max_retries=0,
+    )
 
 
-def get_token_encoder() -> Any:
-    try:
-        import tiktoken
-    except ImportError as exc:
-        raise RuntimeError(
-            "The tiktoken package is required. Run: "
-            "python -m pip install -r requirements.txt"
-        ) from exc
-    return tiktoken.get_encoding(TOKEN_ENCODING)
+def estimate_token_count(text: str) -> int:
+    """Return a dependency-free planning estimate, not a provider token count.
 
-
-def count_tokens(text: str, encoder: Any) -> int:
-    return len(encoder.encode(text))
+    Titan's tokenizer is not exposed by the OpenAI-compatible gateway. Treat
+    each non-ASCII character as one token and each four ASCII characters as
+    one token. Actual batch usage is read from the gateway response instead.
+    """
+    non_ascii_characters = sum(not character.isascii() for character in text)
+    ascii_characters = len(text) - non_ascii_characters
+    return max(non_ascii_characters + math.ceil(ascii_characters / 4), 1)
 
 
 def vector_literal(vector: Sequence[float], dimensions: int) -> str:
@@ -65,12 +85,12 @@ def request_embeddings(
     if not texts:
         return [], 0
 
-    response = client.embeddings.create(
-        input=list(texts),
-        model=model,
-        dimensions=dimensions,
-        encoding_format="float",
-    )
+    # The capstone gateway fixes bedrock-titan-embed-v2 at 1024 dimensions.
+    # Do not send the provider-specific dimensions option: the documented
+    # OpenAI-compatible request accepts only model and input. We still verify
+    # every returned vector below so a gateway configuration mismatch fails
+    # before anything reaches pgvector.
+    response = client.embeddings.create(input=list(texts), model=model)
     data = sorted(response.data, key=lambda item: item.index)
     if len(data) != len(texts):
         raise RuntimeError(
@@ -88,7 +108,11 @@ def request_embeddings(
         vectors.append(vector)
 
     usage = getattr(response, "usage", None)
-    prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+    prompt_tokens = int(
+        getattr(usage, "prompt_tokens", 0)
+        or getattr(usage, "total_tokens", 0)
+        or 0
+    )
     return vectors, prompt_tokens
 
 
@@ -106,6 +130,7 @@ def is_retryable_error(error: Exception) -> bool:
         "billing_not_active",
         "credit_balance_exhausted",
         "insufficient_quota",
+        "budget_exceeded",
     }:
         return False
 

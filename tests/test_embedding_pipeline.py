@@ -1,7 +1,12 @@
 import unittest
 from types import SimpleNamespace
 
+from etl.backfill_embedding_token_estimates import calculate_updates
 from etl.embedding_utils import (
+    DEFAULT_EMBEDDING_DIMENSIONS,
+    DEFAULT_EMBEDDING_MODEL,
+    create_embedding_client,
+    estimate_token_count,
     is_retryable_error,
     request_embeddings,
     suggested_retry_delay,
@@ -51,6 +56,33 @@ class FakeConnection:
 
 
 class EmbeddingUtilsTests(unittest.TestCase):
+    def test_defaults_use_titan_gateway_alias_and_1024_dimensions(self):
+        self.assertEqual(DEFAULT_EMBEDDING_MODEL, "bedrock-titan-embed-v2")
+        self.assertEqual(DEFAULT_EMBEDDING_DIMENSIONS, 1024)
+
+    def test_gateway_client_rejects_missing_or_relative_base_url(self):
+        with self.assertRaisesRegex(ValueError, "API key"):
+            create_embedding_client("", "https://gateway.example/v1")
+        with self.assertRaisesRegex(ValueError, "absolute HTTPS"):
+            create_embedding_client("secret", "/v1")
+        with self.assertRaisesRegex(ValueError, "absolute HTTPS"):
+            create_embedding_client("secret", "http://gateway.example/v1")
+
+    def test_local_token_estimate_never_downloads_a_tokenizer(self):
+        self.assertEqual(estimate_token_count("abcd"), 1)
+        self.assertEqual(estimate_token_count("청년 abcd"), 4)
+        self.assertEqual(estimate_token_count(""), 1)
+
+    def test_token_estimate_backfill_updates_only_mismatched_rows(self):
+        rows = [
+            {"chunk_id": "a", "content": "abcd", "token_count": 99},
+            {"chunk_id": "b", "content": "청년", "token_count": 2},
+        ]
+
+        updates = calculate_updates(rows, "chunk_id")
+
+        self.assertEqual(updates, [(1, "a")])
+
     def test_request_embeddings_restores_input_order_and_usage(self):
         response = SimpleNamespace(
             data=[
@@ -68,7 +100,19 @@ class EmbeddingUtilsTests(unittest.TestCase):
         self.assertEqual(vectors, [[1.0, 0.0], [0.0, 1.0]])
         self.assertEqual(tokens, 7)
         self.assertEqual(client.embeddings.calls[0]["input"], ["첫째", "둘째"])
-        self.assertEqual(client.embeddings.calls[0]["dimensions"], 2)
+        self.assertEqual(client.embeddings.calls[0]["model"], "test-model")
+        self.assertNotIn("dimensions", client.embeddings.calls[0])
+
+    def test_request_embeddings_accepts_total_tokens_usage(self):
+        response = SimpleNamespace(
+            data=[SimpleNamespace(index=0, embedding=[1.0, 0.0])],
+            usage=SimpleNamespace(total_tokens=3),
+        )
+        client = SimpleNamespace(embeddings=FakeEmbeddings(response))
+
+        _, tokens = request_embeddings(client, ["text"], dimensions=2)
+
+        self.assertEqual(tokens, 3)
 
     def test_request_embeddings_rejects_wrong_dimension(self):
         response = SimpleNamespace(
@@ -116,7 +160,6 @@ class VectorSearchTests(unittest.TestCase):
 
         candidates, estimated_tokens = load_candidates(
             conn,
-            encoder=object(),
             model="test-model",
             limit=None,
             retry_errors=False,
@@ -135,7 +178,6 @@ class VectorSearchTests(unittest.TestCase):
 
         candidates, estimated_tokens = load_web_candidates(
             conn,
-            encoder=object(),
             model="test-model",
             policy_nos=["P1"],
             limit=None,
@@ -166,7 +208,7 @@ class VectorSearchTests(unittest.TestCase):
 
         rows = search_chunks(
             conn,
-            [0.0] * 1535 + [1.0],
+            [0.0] * 1023 + [1.0],
             model="test-model",
             limit=5,
             policy_nos=["P1"],

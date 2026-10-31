@@ -1,6 +1,6 @@
 # YouthLink 데이터 사전
 
-작성 기준: 2026-10-30
+작성 기준: 2026-10-31
 
 이 문서는 YouthLink PostgreSQL 스키마의 테이블과 컬럼 의미를 설명합니다. 테이블 간 관계를 그림으로 확인하려면 [erd.md](erd.md)를 참고하세요. 실제 정의의 기준은 `db/schema.sql`과 `db/migrations/`입니다.
 
@@ -342,8 +342,8 @@ RAG 문맥이나 UI에는 숫자 코드보다 `code_name`을 사용합니다. �
 | `content` | `TEXT` | 임베딩과 검색에 사용할 정제 텍스트 |
 | `content_hash` | `VARCHAR(64)` | UTF-8 `content`의 SHA-256 소문자 hex, 변경 감지 기준 |
 | `chunker_version` | `VARCHAR(50)` | 텍스트 생성 규칙 버전. 현재 `policy-v1` |
-| `token_count` | `INTEGER` | 실제 임베딩 입력 토큰 수. 임베딩 전에는 `NULL` |
-| `embedding` | `VECTOR(1536)` | 의미 검색용 임베딩 벡터 |
+| `token_count` | `INTEGER` | 외부 토크나이저가 필요 없는 문자 기반 참고 추정치. 임베딩 전에는 `NULL` |
+| `embedding` | `VECTOR(1024)` | 의미 검색용 임베딩 벡터 |
 | `embedding_model` | `VARCHAR(100)` | 실제 임베딩 생성 모델명. 임베딩 전에는 `NULL` |
 | `embedded_at` | `TIMESTAMPTZ` | 임베딩 생성 완료 시각 |
 | `embedding_error` | `TEXT` | 마지막 임베딩 실패 내용. 성공 전까지 재처리 판단에 사용 |
@@ -360,7 +360,7 @@ RAG 문맥이나 UI에는 숫자 코드보다 `code_name`을 사용합니다. �
 - `content_hash`는 64자리 소문자 SHA-256 형식이고 빈 `content`는 허용하지 않습니다.
 - 임베딩 전에는 `embedding`, `embedding_model`, `embedded_at`이 모두 `NULL`이고, 성공 후에는 셋 모두 값이 있어야 합니다.
 - `embedding IS NOT NULL`인 행에 cosine HNSW 인덱스가 적용됩니다.
-- 사용할 모델은 `text-embedding-3-small`, 벡터 차원은 1536입니다.
+- 사용할 게이트웨이 모델 별칭은 `bedrock-titan-embed-v2`, 벡터 차원은 1024입니다.
 - `etl/generate_policy_chunks.py`가 `policy-v1` 텍스트를 생성하고, `etl/embed_policy_chunks.py`가 명시적인 `--write` 실행에서 임베딩을 적재합니다.
 
 청크별 포함 필드, 지역 압축, 정제 및 변경 감지 규칙은 [RAG 정책 Chunk 생성 전략](rag-chunk-strategy.md)을 기준으로 합니다.
@@ -495,9 +495,9 @@ PK는 `(policy_no, source_id, relation_type)`입니다. 새 연결은 반드시 
 | `content` | `TEXT` | 임베딩·fallback context에 사용할 원문 텍스트 |
 | `content_hash` | `VARCHAR(64)` | 변경 감지·중복 방지 SHA-256 |
 | `chunker_version` | `VARCHAR(50)` | 별도 웹 청크 생성 규칙 버전 |
-| `embedding` | `VECTOR(1536)` | 웹 원문 전용 임베딩 |
+| `embedding` | `VECTOR(1024)` | 웹 원문 전용 임베딩 |
 | `embedding_model` | `VARCHAR(100)` | 임베딩 모델명 |
-| `token_count` | `INTEGER` | 임베딩 입력 토큰 수 |
+| `token_count` | `INTEGER` | 외부 토크나이저가 필요 없는 문자 기반 참고 추정치 |
 | `embedded_at` | `TIMESTAMPTZ` | 임베딩 성공 시각 |
 | `embedding_error` | `TEXT` | 마지막 임베딩 실패 요약 |
 | `created_at`, `updated_at` | `TIMESTAMPTZ` | 생성·변경 시각 |

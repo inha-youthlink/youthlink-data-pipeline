@@ -1,6 +1,6 @@
 # 검증형 정책 원문 수집 파이프라인
 
-작성 기준: 2026-10-30
+작성 기준: 2026-10-31
 
 온통청년 API의 신청·참고 URL에서 부족한 정보를 보강하되, 관련 없는 페이지의 내용이 정책 데이터나 RAG에 들어가지 않도록 수집과 사용을 분리합니다. 이 파이프라인의 최우선 원칙은 **수집 성공이 곧 데이터 승인이라는 뜻이 아니며, `VERIFIED`를 통과한 데이터만 소비하는 것**입니다.
 
@@ -179,7 +179,7 @@ Naver 전체 iframe을 일반적으로 허용하지 않습니다. 다음 조건�
 - 숫자 게시물 URL 4건: `FETCHED`
 - 게시물 ID가 없는 블로그 루트 2건: `UNSUPPORTED`
 - 수동 판정: 광양 드림카페 `VERIFIED` 1건, 완주 관광성 청년몰 글 `LINK_ONLY` 1건, 2024년 익산 모집 글 `LINK_ONLY` 1건, 대학리그와 다른 부산 이스포츠 글 `REJECTED` 1건
-- 승인된 광양 문서: 별도 웹 청크 2개, `text-embedding-3-small` 1536차원 임베딩 2개, API 사용량 3,462토큰
+- 승인된 광양 문서: 별도 웹 청크 2개 생성. 2026-10-31 전체 검증 웹 청크 6건과 함께 1024차원 `bedrock-titan-embed-v2`로 재임베딩 완료
 
 ### 3. 저장된 문서 재검증
 
@@ -299,11 +299,11 @@ LIMIT :limit;
 
 검증되지 않은 `web_document`, `PENDING`, `REVIEW_REQUIRED`, `REJECTED`, `LINK_ONLY` 관계를 웹 청크 생성 입력으로 사용하면 안 됩니다. 웹 청크가 변경되어도 API 기반 `policy_chunk` 임베딩은 그대로 유지됩니다.
 
-## 2026-10-30 로컬 검증 스냅샷
+## 2026-10-31 로컬 검증 스냅샷
 
 - 정책 3,708건, 활성 3,664건, API `policy_chunk` 14,647건
 - 현재 `web_document` 13건, 검증 원문 4건
-- `policy_web_chunk` 6건, 모두 임베딩 완료, 벡터 차원 1536
+- `policy_web_chunk` 6건, 모두 `bedrock-titan-embed-v2` 임베딩 완료, 벡터 차원 1024
 - 미검토 `REVIEW_REQUIRED` 0건
 - 소스 상태: `DISCOVERED` 2,949 / `FETCHED` 13 / `UNSUPPORTED` 3 / `BLOCKED` 5
 - 활성 관계 상태: `PENDING` 4,478 / `VERIFIED` 4 / `LINK_ONLY` 14 / `REJECTED` 1

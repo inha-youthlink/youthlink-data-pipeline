@@ -14,9 +14,8 @@ try:
     from .embedding_utils import (
         DEFAULT_EMBEDDING_DIMENSIONS,
         DEFAULT_EMBEDDING_MODEL,
-        count_tokens,
-        create_openai_client,
-        get_token_encoder,
+        create_embedding_client,
+        estimate_token_count,
         is_retryable_error,
         request_embeddings,
         suggested_retry_delay,
@@ -26,9 +25,8 @@ except ImportError:  # Direct execution: python etl/embed_policy_web_chunks.py
     from embedding_utils import (
         DEFAULT_EMBEDDING_DIMENSIONS,
         DEFAULT_EMBEDDING_MODEL,
-        count_tokens,
-        create_openai_client,
-        get_token_encoder,
+        create_embedding_client,
+        estimate_token_count,
         is_retryable_error,
         request_embeddings,
         suggested_retry_delay,
@@ -44,8 +42,9 @@ DB_DSN = os.getenv(
     "postgresql://postgres:postgres@localhost:5432/youthlink",
 )
 EMBEDDING_MODEL = os.getenv(
-    "OPENAI_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL
+    "LITELLM_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL
 ).strip()
+EMBEDDING_API_BASE_URL = os.getenv("LITELLM_BASE_URL", "").strip()
 EMBEDDING_DIMENSIONS = DEFAULT_EMBEDDING_DIMENSIONS
 
 
@@ -65,7 +64,6 @@ def _batched(values: Sequence[Candidate], size: int) -> list[Sequence[Candidate]
 def load_candidates(
     conn: psycopg.Connection[Any],
     *,
-    encoder: Any,
     model: str,
     policy_nos: Sequence[str],
     limit: int | None,
@@ -111,7 +109,7 @@ def load_candidates(
             policy_no=row["policy_no"],
             document_id=row["document_id"],
             content=row["content"],
-            token_count=count_tokens(row["content"], encoder),
+            token_count=estimate_token_count(row["content"]),
         )
         for row in rows
     ]
@@ -239,12 +237,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    encoder = get_token_encoder()
 
     with psycopg.connect(DB_DSN) as conn:
         candidates, estimated_tokens = load_candidates(
             conn,
-            encoder=encoder,
             model=EMBEDDING_MODEL,
             policy_nos=args.policy_no,
             limit=args.limit,
@@ -265,10 +261,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             return 0
 
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        api_key = os.getenv("LITELLM_API_KEY", "").strip()
         if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is required when --write is used")
-        client = create_openai_client(api_key)
+            raise RuntimeError(
+                "LITELLM_API_KEY is required when --write is used"
+            )
+        if not EMBEDDING_API_BASE_URL:
+            raise RuntimeError(
+                "LITELLM_BASE_URL is required when --write is used"
+            )
+        client = create_embedding_client(api_key, EMBEDDING_API_BASE_URL)
 
         succeeded = 0
         failed = 0

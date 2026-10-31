@@ -2,9 +2,9 @@
 
 온통청년 API의 청년 지원 정책을 수집·정제하여 PostgreSQL에 저장하는 YouthLink의 데이터 파이프라인입니다. 정책 검색과 맞춤형 추천에 필요한 데이터를 준비하고, 이후 pgvector 기반 RAG와 챗봇으로 연결하는 것을 목표로 합니다.
 
-정책 ETL은 `policy`, `policy_application_period`, `policy_region`, `policy_eligibility_code` 4개 테이블을 적재합니다. 지역 ETL은 VWorld의 시도·시군구 정보를 `region`에 동기화하며, 지역 View를 통해 과거·상위 코드와 알려진 범위 누락을 현재 코드로 해석합니다. `common_code`는 SQL seed로 채웁니다. 정책 청크 생성, OpenAI 임베딩 적재, pgvector cosine 검색 파이프라인이 구현되어 있습니다.
+정책 ETL은 `policy`, `policy_application_period`, `policy_region`, `policy_eligibility_code` 4개 테이블을 적재합니다. 지역 ETL은 VWorld의 시도·시군구 정보를 `region`에 동기화하며, 지역 View를 통해 과거·상위 코드와 알려진 범위 누락을 현재 코드로 해석합니다. `common_code`는 SQL seed로 채웁니다. 정책 청크 생성, LiteLLM 게이트웨이 기반 Titan V2 임베딩 적재, pgvector cosine 검색 파이프라인이 구현되어 있습니다.
 
-> 작성 기준: 2026-10-30에 정리한 프로젝트 구현 상태. 아래의 구현 현황은 코드 기준이며, 실제 운영 DB 상태는 각 환경에서 검증해야 합니다.
+> 작성 기준: 2026-10-31에 정리한 프로젝트 구현 상태. 아래의 구현 현황은 코드 기준이며, 실제 운영 DB 상태는 각 환경에서 검증해야 합니다.
 
 ## 문서
 
@@ -53,7 +53,9 @@ youthlink-data-pipeline/
 │   ├── load_regions.py         # VWorld 시도·시군구 동기화 및 검증
 │   ├── generate_policy_chunks.py # 결정적 RAG 청크 생성·동기화
 │   ├── embedding_utils.py      # 임베딩·벡터 공통 검증 함수
-│   ├── embed_policy_chunks.py  # OpenAI 임베딩 배치 생성·적재
+│   ├── embed_policy_chunks.py  # Titan V2 임베딩 배치 생성·적재
+│   ├── backfill_embedding_token_estimates.py # 로컬 토큰 추정치 무비용 보정
+│   ├── test_embedding_gateway.py # 게이트웨이 인증·1024차원 무DB 점검
 │   ├── search_policy_chunks.py # 질문 임베딩·pgvector cosine 검색
 │   ├── sync_policy_sources.py  # 정책 URL 정규화·연결 동기화
 │   ├── crawl_policy_sources.py # 안전한 소량 HTML 수집·관련성 검증
@@ -110,7 +112,7 @@ API 원천 계층과 크롤링 계층은 서로 덮어쓰지 않습니다. `poli
 
 정책 하나에는 여러 지역·자격 조건·청크가 연결됩니다. 대화방에는 프로필 하나와 여러 메시지가 연결되며, 메시지와 정책은 `message_policy_ref`로 연결합니다. `common_code`는 코드 해석용 사전이며, 현재 정책의 코드 컬럼에 공통 코드 외래키를 강제하지는 않습니다.
 
-`policy_chunk.embedding`은 `VECTOR(1536)`이며 사용할 임베딩 모델은 `text-embedding-3-small`입니다. 코사인 거리용 HNSW 인덱스가 정의되어 있습니다. 아직 임베딩되지 않은 청크는 벡터·모델명·임베딩 시각이 모두 `NULL`입니다. 청크 생성기는 API를 호출하지 않고, 별도의 임베딩 CLI가 명시적인 `--write` 실행에서만 API를 호출합니다. 모델이나 차원을 변경한다면 컬럼·인덱스·기존 임베딩의 재생성 계획을 함께 조정해야 합니다.
+`policy_chunk.embedding`은 `VECTOR(1024)`이며 캡스톤 LiteLLM 게이트웨이의 `bedrock-titan-embed-v2`를 사용합니다. 코사인 거리용 HNSW 인덱스가 정의되어 있습니다. 아직 임베딩되지 않은 청크는 벡터·모델명·임베딩 시각이 모두 `NULL`입니다. 청크 생성기는 API를 호출하지 않고, 별도의 임베딩 CLI가 명시적인 `--write` 실행에서만 게이트웨이를 호출합니다.
 
 ### DB 준비
 
@@ -151,9 +153,11 @@ psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/m
 psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/010_bind_web_validation_to_document.sql
 psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/011_add_separate_policy_web_chunks.sql
 psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/012_enforce_validated_document_source.sql
+psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/013_change_embedding_dimension_to_1024.sql
+psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/014_resolve_daejeon_parent_region.sql
 ```
 
-`region_code_mapping.canonical_code`는 `region.region_code`를 참조하므로 **VWorld 지역 적재를 매핑 seed보다 먼저** 실행해야 합니다. 004는 레거시 alias를 이관·제거하고, 006은 정확한 복수 신청기간 테이블을 추가합니다. 기존 DB는 006 뒤 `backfill-periods`로 원문을 재파싱합니다. 007은 인천 범위 누락 보정과 공용 지역 범위 View를, 008은 정책 동기화 작업과 소프트 비활성화를, 009는 검증형 웹 원문 staging 계층을 추가합니다. 010은 관련성 판정을 실제로 검사한 `web_document` 버전에 묶습니다. 011은 API 기반 `policy_chunk`와 완전히 분리된 크롤링 fallback 청크·벡터 계층을 추가하며, 012는 판정 문서가 동일 `web_source` 소속임을 복합 FK로 강제합니다.
+`region_code_mapping.canonical_code`는 `region.region_code`를 참조하므로 **VWorld 지역 적재를 매핑 seed보다 먼저** 실행해야 합니다. 004는 레거시 alias를 이관·제거하고, 006은 정확한 복수 신청기간 테이블을 추가합니다. 기존 DB는 006 뒤 `backfill-periods`로 원문을 재파싱합니다. 007은 인천 범위 누락 보정과 공용 지역 범위 View를, 008은 정책 동기화 작업과 소프트 비활성화를, 009는 검증형 웹 원문 staging 계층을 추가합니다. 010은 관련성 판정을 실제로 검사한 `web_document` 버전에 묶습니다. 011은 API 기반 `policy_chunk`와 완전히 분리된 크롤링 fallback 청크·벡터 계층을 추가하며, 012는 판정 문서가 동일 `web_source` 소속임을 복합 FK로 강제합니다. 013은 기존 1536차원 임베딩 파생값을 초기화하고 두 청크 테이블과 HNSW 인덱스를 Titan V2용 1024차원으로 전환합니다. 014는 대전광역시 상위 코드 `30000`을 현재 5개 구로 확장합니다.
 
 현재 별도의 마이그레이션 이력 도구는 없습니다. 적용한 파일과 순서를 환경별로 기록하고, 번호 순서에 따라 수동으로 적용하세요. 기존 DB에서는 이미 적용한 마이그레이션을 무조건 반복 실행하지 말고 현재 스키마와 데이터를 먼저 확인합니다.
 
@@ -193,7 +197,7 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-주요 의존성은 PostgreSQL 연결용 `psycopg[binary]`, HTTP 요청용 `requests`, `.env` 로딩용 `python-dotenv`, 임베딩용 공식 `openai` SDK, 토큰 계산용 `tiktoken`입니다. PowerShell에서 활성화가 제한되면 `.\.venv\Scripts\python.exe`를 `python` 대신 사용해 설치·실행할 수 있습니다.
+주요 의존성은 PostgreSQL 연결용 `psycopg[binary]`, HTTP 요청용 `requests`, `.env` 로딩용 `python-dotenv`, OpenAI 호환 LiteLLM 게이트웨이 호출용 `openai` SDK입니다. AWS SDK와 외부 토크나이저는 사용하지 않습니다. 계획 모드의 토큰 수는 다운로드가 필요 없는 문자 기반 참고 추정치이며, 실제 배치 사용량은 게이트웨이 응답을 사용합니다. PowerShell에서 활성화가 제한되면 `.\.venv\Scripts\python.exe`를 `python` 대신 사용해 설치·실행할 수 있습니다.
 
 ### 자동 테스트
 
@@ -235,9 +239,10 @@ VWORLD_API_DOMAIN=http://localhost
 # PostgreSQL
 DATABASE_URL=postgresql://postgres:YOUR_PASSWORD@localhost:5432/youthlink
 
-# OpenAI Embeddings
-OPENAI_API_KEY=
-OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+# Capstone LiteLLM gateway
+LITELLM_API_KEY=
+LITELLM_BASE_URL=https://3.226.2.148/v1
+LITELLM_EMBEDDING_MODEL=bedrock-titan-embed-v2
 
 # Policy web-source crawler
 YOUTHLINK_CRAWLER_USER_AGENT=YouthLinkResearchBot/0.1
@@ -257,8 +262,9 @@ YOUTHLINK_CRAWLER_MAX_RESPONSE_BYTES=2097152
 | `VWORLD_API_KEY` | VWorld에서 발급받은 인증키. 개인 `.env`에만 입력 |
 | `VWORLD_API_DOMAIN` | VWorld 인증키에 등록한 요청 도메인. 로컬 개발은 보통 `http://localhost` 사용 |
 | `DATABASE_URL` | 적재 대상 PostgreSQL 연결 문자열 |
-| `OPENAI_API_KEY` | 임베딩을 실제 생성할 때만 필요한 개인 API 키. Git에 커밋하지 않음 |
-| `OPENAI_EMBEDDING_MODEL` | 임베딩 모델. 기본 `text-embedding-3-small` |
+| `LITELLM_API_KEY` | 캡스톤 게이트웨이에서 발급받은 팀 API 키. 개인 `.env`에만 입력 |
+| `LITELLM_BASE_URL` | OpenAI 호환 게이트웨이 주소. 기본 `https://3.226.2.148/v1` |
+| `LITELLM_EMBEDDING_MODEL` | 게이트웨이 임베딩 별칭. 기본 `bedrock-titan-embed-v2` |
 | `YOUTHLINK_CRAWLER_USER_AGENT` | 웹 원문 요청에 표시할 식별자. 운영 전 팀 연락처를 포함한 값으로 합의 권장 |
 | `YOUTHLINK_CRAWLER_REQUEST_DELAY_SECONDS` | 서로 다른 원문 요청 사이 대기시간. 기본 2초 |
 | `YOUTHLINK_CRAWLER_TIMEOUT_SECONDS` | 원문·robots.txt 요청 제한시간. 기본 15초 |
@@ -266,7 +272,7 @@ YOUTHLINK_CRAWLER_MAX_RESPONSE_BYTES=2097152
 
 `YOUR_PASSWORD`는 자리표시자입니다. 실제 DB 사용자와 비밀번호로 변경하고, 연결 문자열의 비밀번호에 `@`, `:`, `/` 등 특수문자가 있으면 URL 인코딩해야 합니다. Python 실행 시 `load_dotenv()`가 설정을 읽습니다. 일반 `psql` 명령은 이 `.env`를 자동으로 읽지 않습니다.
 
-정책 파일 모드는 DB 설정만 필요하고, 정책 API 모드는 `YOUTH_API_*`와 DB 설정을 확인해야 합니다. 지역 동기화에는 `VWORLD_API_KEY`, `VWORLD_API_DOMAIN`, `DATABASE_URL`이 필요합니다. VWorld 인증키의 허용 도메인과 `VWORLD_API_DOMAIN` 값이 다르면 요청이 거절될 수 있습니다. `OPENAI_API_KEY`는 정책·지역·청크 생성에는 필요하지 않으며 임베딩 적재와 질문 벡터 검색에만 사용합니다.
+정책 파일 모드는 DB 설정만 필요하고, 정책 API 모드는 `YOUTH_API_*`와 DB 설정을 확인해야 합니다. 지역 동기화에는 `VWORLD_API_KEY`, `VWORLD_API_DOMAIN`, `DATABASE_URL`이 필요합니다. VWorld 인증키의 허용 도메인과 `VWORLD_API_DOMAIN` 값이 다르면 요청이 거절될 수 있습니다. `LITELLM_API_KEY`는 정책·지역·청크 생성에는 필요하지 않으며 임베딩 적재와 질문 벡터 검색에만 사용합니다. 기존 `OPENAI_API_KEY`를 자동으로 대체 사용하지 않습니다.
 
 ## 6. 샘플 JSON 테스트
 
@@ -347,7 +353,7 @@ flowchart TD
 python etl/load_regions.py
 ```
 
-지역 ETL은 VWorld에서 시도·시군구 목록을 조회하고 응답의 중복, 코드 형식, 최소 지역 수 등을 검증한 뒤 `region`을 UPSERT합니다. 동기화가 끝나면 `policy_region`의 원본 코드 중 `region`에도 없고 `region_code_mapping`에도 없는 코드를 자동으로 검사합니다. 미해결 코드 0건이 운영 목표이며, 2026-10-30 기준 새로 발견된 대전 상위 코드 `30000` 1건은 후속 매핑 대상으로 남아 있습니다.
+지역 ETL은 VWorld에서 시도·시군구 목록을 조회하고 응답의 중복, 코드 형식, 최소 지역 수 등을 검증한 뒤 `region`을 UPSERT합니다. 동기화가 끝나면 `policy_region`의 원본 코드 중 `region`에도 없고 `region_code_mapping`에도 없는 코드를 자동으로 검사합니다. 대전광역시 상위 코드 `30000`은 원본을 보존하면서 현재 5개 구로 확장하며, 2026-10-31 검증 기준 미해결 코드는 0건입니다.
 
 ```text
 === policy region validation ===
@@ -618,9 +624,10 @@ python etl/embed_policy_chunks.py
 
 정책 데이터가 바뀌면 계획 모드로 대상과 토큰 수를 다시 확인해야 하며 실제 사용량과 요금은 API 응답 및 실행 시점 공식 가격을 기준으로 합니다. 비활성 정책의 기존 벡터는 보존되지만 새 임베딩 후보와 검색 결과에서는 제외됩니다.
 
-개인 `.env`에 `OPENAI_API_KEY`를 설정한 뒤 소량부터 실행합니다.
+개인 `.env`에 `LITELLM_API_KEY`, `LITELLM_BASE_URL`, `LITELLM_EMBEDDING_MODEL`을 설정한 뒤 소량부터 실행합니다. 출력 벡터는 코드와 DB에서 1024차원인지 검증합니다.
 
 ```bash
+python etl/test_embedding_gateway.py
 python etl/embed_policy_chunks.py --write --limit 10
 python etl/embed_policy_chunks.py --write
 ```
@@ -704,12 +711,18 @@ FROM (
 ) duplicated;
 
 SELECT
-    COUNT(*) FILTER (WHERE embedding IS NOT NULL) AS embedded,
+    COUNT(*) FILTER (WHERE p.is_active AND pc.embedding IS NOT NULL) AS active_embedded,
     COUNT(*) FILTER (
-        WHERE embedding IS NULL AND embedding_error IS NULL
-    ) AS pending,
-    COUNT(*) FILTER (WHERE embedding_error IS NOT NULL) AS failed
-FROM policy_chunk;
+        WHERE p.is_active
+          AND pc.embedding IS NULL
+          AND pc.embedding_error IS NULL
+    ) AS active_pending,
+    COUNT(*) FILTER (WHERE pc.embedding_error IS NOT NULL) AS failed,
+    COUNT(*) FILTER (
+        WHERE NOT p.is_active AND pc.embedding IS NULL
+    ) AS inactive_preserved_without_embedding
+FROM policy_chunk pc
+JOIN policy p ON p.policy_no = pc.policy_no;
 
 SELECT embedding_model, vector_dims(embedding), COUNT(*)
 FROM policy_chunk
@@ -794,7 +807,7 @@ DB에 들어간 행만 검사하면 롤백된 실패 정책은 보이지 않습�
 - 복수 신청기간의 정확한 행 저장과 더미·역전 날짜 안전 처리
 - 인천 9개 코드 범위 누락 보정 및 전국·시도 전체 공용 판정 View
 - 지역 동기화 후 미해결 온통청년 코드 자동 검증
-- pgvector 1536차원 컬럼과 코사인 HNSW 인덱스 정의
+- pgvector 1024차원 컬럼과 코사인 HNSW 인덱스 정의
 - 공통 코드 seed와 재실행 가능한 코드 갱신
 - 온통청년 API 페이지 요청, 데이터 정제, 원문 JSONB 보존
 - 정책 UPSERT 및 지역·자격 조건 재동기화
@@ -805,7 +818,7 @@ DB에 들어간 행만 검사하면 롤백된 실패 정책은 보이지 않습�
 - 고정 총건수 상한 없이 페이지를 순회하는 수집
 - 정책 변환·CLI·API 응답과 VWorld 필터/중복 처리 단위 테스트 및 CI
 - `policy-v1` 청크 전략, 변경 감지 스키마, 결정적 청크 생성·동기화 CLI
-- OpenAI 임베딩 계획·배치 적재·재시도·오류 기록 CLI
+- LiteLLM 게이트웨이 기반 Titan V2 1024차원 임베딩 계획·배치 적재·재시도·오류 기록 CLI
 - 질문 임베딩과 pgvector cosine 검색, 정책 번호·청크 유형 후보 필터
 - 활성 정책 URL 정규화·동기화와 `PENDING` staging 연결
 - DNS·리다이렉트·robots.txt·응답 제한을 적용한 소량 HTML 수집기
@@ -815,7 +828,7 @@ DB에 들어간 행만 검사하면 롤백된 실패 정책은 보이지 않습�
 - 검증 원문 전용 `policy_web_chunk` 생성·임베딩 및 RAG fallback View
 - 샘플 파일 처리 함수, 환경변수 템플릿, 의존성 목록 및 Git 제외 규칙
 
-2026-10-30 검증 기준 로컬 DB에는 정책 3,708건이 보존되어 있으며 3,664건은 활성, 원천에서 사라진 44건은 비활성 상태입니다. API 기반 임베딩 청크 14,647건은 그대로 유지됩니다. URL inventory는 활성 정책-URL 연결 4,497개와 고유 원문 2,970개입니다. 현재 원문 13건이 있고, 정책-URL 관계는 `VERIFIED` 4행, `LINK_ONLY` 14행, `REJECTED` 1행, `PENDING` 4,478행이며 미검토 `REVIEW_REQUIRED`는 0행입니다. 소스 상태는 `FETCHED` 13건, `UNSUPPORTED` 3건, `BLOCKED` 5건, `DISCOVERED` 2,949건입니다. 검증 원문 4건에서 API corpus와 분리된 웹 청크 6건을 만들었고 모두 `text-embedding-3-small` 1536차원 벡터로 저장했습니다.
+2026-10-31 검증 기준 로컬 DB에는 정책 3,708건이 보존되어 있으며 3,664건은 활성, 원천에서 사라진 44건은 비활성 상태입니다. API 기반 청크 14,647건 중 활성 정책 청크 14,471건은 모두 `bedrock-titan-embed-v2` 1024차원으로 임베딩됐고, 비활성 정책 청크 176건은 비용을 쓰지 않고 본문만 보존합니다. URL inventory는 활성 정책-URL 연결 4,497개와 고유 원문 2,970개입니다. 현재 원문 13건이 있고, 정책-URL 관계는 `VERIFIED` 4행, `LINK_ONLY` 14행, `REJECTED` 1행, `PENDING` 4,478행이며 미검토 `REVIEW_REQUIRED`는 0행입니다. 소스 상태는 `FETCHED` 13건, `UNSUPPORTED` 3건, `BLOCKED` 5건, `DISCOVERED` 2,949건입니다. 검증 원문 4건에서 API corpus와 분리된 웹 청크 6건을 만들었고, 6건 모두 같은 Titan V2 1024차원 모델로 임베딩했습니다.
 
-같은 날 Naver 6건 파일럿에서는 숫자 게시물 URL 4건만 iframe 본문 수집에 성공했고, 게시물 ID가 없는 블로그 루트 2건은 `UNSUPPORTED`로 유지했습니다. 새 본문 4건은 모두 자동 승인 없이 검토했으며 광양 드림카페 1건만 `VERIFIED`, 완주 관광성 청년몰 글과 2024년 익산 모집 글은 `LINK_ONLY`, 대학리그와 다른 내용의 부산 이스포츠 글은 `REJECTED`로 판정했습니다. 승인된 광양 문서에서 웹 청크 2개를 만들고 총 3,462토큰을 임베딩했습니다. 이 과정에서 API `policy`와 `policy_chunk`는 수정하지 않았습니다.
+2026-10-30 Naver 6건 파일럿에서는 숫자 게시물 URL 4건만 iframe 본문 수집에 성공했고, 게시물 ID가 없는 블로그 루트 2건은 `UNSUPPORTED`로 유지했습니다. 새 본문 4건은 모두 자동 승인 없이 검토했으며 광양 드림카페 1건만 `VERIFIED`, 완주 관광성 청년몰 글과 2024년 익산 모집 글은 `LINK_ONLY`, 대학리그와 다른 내용의 부산 이스포츠 글은 `REJECTED`로 판정했습니다. 이 과정과 별도 웹 임베딩은 API `policy`와 `policy_chunk`를 수정하지 않습니다.
 

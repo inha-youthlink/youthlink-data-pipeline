@@ -2,8 +2,8 @@
 -- PostgreSQL + pgvector
 --
 -- Embedding model:
---   text-embedding-3-small
---   dimension: 1536
+--   bedrock-titan-embed-v2 (1024 dimensions, LiteLLM gateway)
+--   dimension: 1024
 --   distance: cosine
 --
 -- Run db/extensions.sql before this file.
@@ -294,7 +294,7 @@ CREATE TABLE IF NOT EXISTS policy_chunk (
     chunker_version     VARCHAR(50) NOT NULL,
     token_count         INTEGER,
 
-    embedding           VECTOR(1536),
+    embedding           VECTOR(1024),
     embedding_model     VARCHAR(100),
     embedded_at         TIMESTAMPTZ,
     embedding_error     TEXT,
@@ -683,7 +683,7 @@ CREATE TABLE IF NOT EXISTS policy_web_chunk (
     content                TEXT NOT NULL,
     content_hash           VARCHAR(64) NOT NULL,
     chunker_version        VARCHAR(50) NOT NULL,
-    embedding              VECTOR(1536),
+    embedding              VECTOR(1024),
     embedding_model        VARCHAR(100),
     token_count            INTEGER,
     embedded_at            TIMESTAMPTZ,
