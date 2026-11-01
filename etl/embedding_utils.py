@@ -76,6 +76,19 @@ def vector_literal(vector: Sequence[float], dimensions: int) -> str:
     return "[" + ",".join(values) + "]"
 
 
+def reject_binary_vector(vector: Sequence[float]) -> None:
+    """Fail before storage if the gateway returned binary (0/1) embeddings.
+
+    A float embedding is never made of only 0 and 1. Seeing that means the
+    request was served as Titan binary output (see request_embeddings).
+    """
+    if vector and all(value in (0.0, 1.0) for value in vector):
+        raise ValueError(
+            "Embedding API returned a binary (0/1) vector; "
+            "request encoding_format='float'"
+        )
+
+
 def request_embeddings(
     client: Any,
     texts: Sequence[str],
@@ -90,7 +103,17 @@ def request_embeddings(
     # OpenAI-compatible request accepts only model and input. We still verify
     # every returned vector below so a gateway configuration mismatch fails
     # before anything reaches pgvector.
-    response = client.embeddings.create(input=list(texts), model=model)
+    #
+    # encoding_format must be explicit. The OpenAI SDK sends "base64" when it
+    # is omitted, and the gateway maps that to Titan's binary output, so every
+    # dimension arrives as 0 or 1 instead of a float. Binary vectors keep only
+    # about 1/32 of the information and compress cosine scores into a narrow
+    # band, which breaks retrieval ranking.
+    response = client.embeddings.create(
+        input=list(texts),
+        model=model,
+        encoding_format="float",
+    )
     data = sorted(response.data, key=lambda item: item.index)
     if len(data) != len(texts):
         raise RuntimeError(
@@ -105,6 +128,7 @@ def request_embeddings(
             )
         vector = [float(value) for value in item.embedding]
         vector_literal(vector, dimensions)
+        reject_binary_vector(vector)
         vectors.append(vector)
 
     usage = getattr(response, "usage", None)

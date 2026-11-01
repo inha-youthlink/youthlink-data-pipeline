@@ -8,6 +8,7 @@ from etl.embedding_utils import (
     create_embedding_client,
     estimate_token_count,
     is_retryable_error,
+    reject_binary_vector,
     request_embeddings,
     suggested_retry_delay,
     vector_literal,
@@ -86,8 +87,8 @@ class EmbeddingUtilsTests(unittest.TestCase):
     def test_request_embeddings_restores_input_order_and_usage(self):
         response = SimpleNamespace(
             data=[
-                SimpleNamespace(index=1, embedding=[0.0, 1.0]),
-                SimpleNamespace(index=0, embedding=[1.0, 0.0]),
+                SimpleNamespace(index=1, embedding=[0.8, -0.6]),
+                SimpleNamespace(index=0, embedding=[0.6, 0.8]),
             ],
             usage=SimpleNamespace(prompt_tokens=7),
         )
@@ -97,15 +98,40 @@ class EmbeddingUtilsTests(unittest.TestCase):
             client, ["첫째", "둘째"], model="test-model", dimensions=2
         )
 
-        self.assertEqual(vectors, [[1.0, 0.0], [0.0, 1.0]])
+        self.assertEqual(vectors, [[0.6, 0.8], [0.8, -0.6]])
         self.assertEqual(tokens, 7)
         self.assertEqual(client.embeddings.calls[0]["input"], ["첫째", "둘째"])
         self.assertEqual(client.embeddings.calls[0]["model"], "test-model")
         self.assertNotIn("dimensions", client.embeddings.calls[0])
 
+    def test_request_embeddings_asks_for_float_encoding(self):
+        response = SimpleNamespace(
+            data=[SimpleNamespace(index=0, embedding=[0.6, 0.8])],
+            usage=SimpleNamespace(prompt_tokens=1),
+        )
+        client = SimpleNamespace(embeddings=FakeEmbeddings(response))
+
+        request_embeddings(client, ["text"], dimensions=2)
+
+        # Without it the SDK sends base64 and the gateway returns binary 0/1.
+        self.assertEqual(client.embeddings.calls[0]["encoding_format"], "float")
+
+    def test_request_embeddings_rejects_binary_vectors(self):
+        response = SimpleNamespace(
+            data=[SimpleNamespace(index=0, embedding=[1, 0, 0, 1])],
+            usage=SimpleNamespace(prompt_tokens=1),
+        )
+        client = SimpleNamespace(embeddings=FakeEmbeddings(response))
+
+        with self.assertRaisesRegex(ValueError, "binary"):
+            request_embeddings(client, ["text"], dimensions=4)
+
+    def test_reject_binary_vector_accepts_float_values(self):
+        reject_binary_vector([0.031, -0.0127, 1.0, 0.0])
+
     def test_request_embeddings_accepts_total_tokens_usage(self):
         response = SimpleNamespace(
-            data=[SimpleNamespace(index=0, embedding=[1.0, 0.0])],
+            data=[SimpleNamespace(index=0, embedding=[0.6, 0.8])],
             usage=SimpleNamespace(total_tokens=3),
         )
         client = SimpleNamespace(embeddings=FakeEmbeddings(response))
