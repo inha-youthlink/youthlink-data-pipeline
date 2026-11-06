@@ -1,6 +1,6 @@
 # 검증형 정책 원문 수집 파이프라인
 
-작성 기준: 2026-10-31
+작성 기준: 2026-11-06
 
 온통청년 API의 신청·참고 URL에서 부족한 정보를 보강하되, 관련 없는 페이지의 내용이 정책 데이터나 RAG에 들어가지 않도록 수집과 사용을 분리합니다. 이 파이프라인의 최우선 원칙은 **수집 성공이 곧 데이터 승인이라는 뜻이 아니며, `VERIFIED`를 통과한 데이터만 소비하는 것**입니다.
 
@@ -13,10 +13,11 @@
   → robots.txt·DNS·응답 제한을 적용한 HTML 수집
   → web_document(staging)
   → 정책-페이지 관련성 판정
+  → REVIEW_REQUIRED는 선택적으로 AI 근거 추출·코드 재검증
   → VERIFIED만 검증 전용 View에 노출
 ```
 
-현재 구현은 URL 발견·동기화, 소량 HTML 수집, 정책-페이지 관련성 판정, 검증 원문의 별도 웹 청크·임베딩 파이프라인까지입니다. `policy_enrichment_fact`는 선택적인 필드 추출·검수용 스키마이며, 현재 크롤러가 자동으로 사실을 생성하지는 않습니다. 크롤링 결과는 기존 `policy`와 `policy_chunk`에 합치지 않습니다.
+현재 구현은 URL 발견·동기화, 소량 HTML 수집, 정책-페이지 관련성 판정, `REVIEW_REQUIRED`의 AI 보조 근거 검증, 검증 원문의 별도 웹 청크·임베딩 파이프라인까지입니다. `policy_enrichment_fact`는 선택적인 필드 추출·검수용 스키마이며, 현재 크롤러가 자동으로 사실을 생성하지는 않습니다. 크롤링 결과는 기존 `policy`와 `policy_chunk`에 합치지 않습니다.
 
 ## 잘못된 원문 유입을 막는 경계
 
@@ -28,7 +29,8 @@
 6. 정책 번호·정확한 정책명·기관·지역·신청기간 같은 결정적 신호로 정책과 페이지의 관계를 판정합니다. URL의 정책 번호 하나만으로 승인하지 않으며, 임베딩이나 LLM 점수만으로도 자동 승인하지 않습니다.
 7. 판정은 `validated_document_id`로 검사한 문서 버전에 고정합니다. 같은 URL의 본문이 바뀌면 과거 승인이 새 문서로 자동 승계되지 않습니다.
 8. 정확한 Naver 게시물 URL의 제한형 iframe 수집도 자동 승인하지 않고 항상 `REVIEW_REQUIRED`로 보냅니다.
-9. RAG와 백엔드는 staging 테이블을 직접 사용하지 않고 `v_verified_policy_web_document` 또는 `v_verified_policy_enrichment`만 사용합니다.
+9. AI는 승인 상태를 직접 결정하지 않고 구조화된 직접 인용만 추출합니다. 코드는 인용이 저장 문서에 실제로 존재하는지와 API 소유 정책값이 일치하는지 다시 검사하며, shadow 실행만으로는 관계 상태가 바뀌지 않습니다.
+10. RAG와 백엔드는 staging 테이블을 직접 사용하지 않고 `v_verified_policy_web_document` 또는 `v_verified_policy_enrichment`만 사용합니다.
 
 DNS 검사는 요청 직전의 목적지 검증이지만, 향후 운영 환경에서는 네트워크 egress 제한과 허용 도메인 정책도 함께 적용하는 것이 좋습니다.
 
@@ -64,8 +66,10 @@ URL 또는 메타데이터의 정책 번호가 정확히 일치하더라도 페�
 | `web_source` | 정규화한 고유 URL 하나와 마지막 HTTP 수집 상태 |
 | `policy_web_source` | 정책 하나와 URL 하나의 관계 유형·활성 여부·검증 결과 및 검증한 문서 버전 |
 | `web_document` | URL에서 특정 시점에 추출한 본문 버전 하나 |
+| `policy_web_ai_review` | 정확한 정책·문서 버전에 고정된 AI 근거 추출 및 코드 재검증 관찰 하나 |
 | `policy_enrichment_fact` | 원문에서 추출한 정책 필드값 하나와 직접 근거·검증 결과 |
 | `policy_web_chunk` | 검증된 원문만 나눈 별도 RAG fallback 청크·임베딩 |
+| `rag_retrieval_chunk` | 활성 API 청크와 현재 검증 웹 청크를 발행한 단일 검색 projection |
 | `v_verified_policy_web_document` | 활성 정책과 `VERIFIED` 관계로 연결된 최신 원문 |
 | `v_verified_policy_enrichment` | 검증된 관계의 최신 문서에서 나온 `VERIFIED` 사실 |
 | `v_verified_policy_web_chunk` | 현재 검증 문서에 연결된 별도 웹 청크와 출처 |
@@ -74,16 +78,19 @@ URL 또는 메타데이터의 정책 번호가 정확히 일치하더라도 페�
 
 ## 실행 순서
 
-먼저 009~012 마이그레이션을 순서대로 적용합니다.
+먼저 웹 원문 009~012를 정확한 파일명 순서로 적용하고, Titan 1024차원 전환 013, 통합 검색 016, AI 검토 관찰 017 순서로 적용합니다. 저장소에는 과거 chat migration과 번호가 중복된 009 파일이 있으므로 번호만 보고 선택하지 않습니다.
 
 ```bash
 psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/009_add_policy_web_sources.sql
 psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/010_bind_web_validation_to_document.sql
 psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/011_add_separate_policy_web_chunks.sql
 psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/012_enforce_validated_document_source.sql
+psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/013_change_embedding_dimension_to_1024.sql
+psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/016_add_rag_retrieval_chunks.sql
+psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/017_add_policy_web_ai_review.sql
 ```
 
-012는 `validated_document_id`가 존재하는지만 보지 않고 그 문서가 해당 `source_id` 소속인지까지 복합 FK로 강제합니다. 잘못된 출처의 문서 버전을 판정에 연결하려 하면 DB가 저장을 거부합니다.
+012는 `validated_document_id`가 존재하는지만 보지 않고 그 문서가 해당 `source_id` 소속인지까지 복합 FK로 강제합니다. 잘못된 출처의 문서 버전을 판정에 연결하려 하면 DB가 저장을 거부합니다. 017은 AI 관찰을 동일 출처의 정확한 문서에 복합 FK로 고정하고, 성공한 동일 입력만 캐시합니다.
 
 ### 1. URL 목록 확인
 
@@ -190,11 +197,39 @@ python etl/revalidate_policy_sources.py --limit 100
 python etl/revalidate_policy_sources.py --limit 100 --write
 ```
 
+이 명령은 적용된 AI 관찰의 정책 근거 hash도 현재 정책명·기관·지역·신청기간·고유어로 다시 계산합니다. 정책 API나 지역 해석 변경으로 hash가 달라진 판정은 `REVIEW_REQUIRED`로 안전하게 되돌립니다. 현재 결정적 검증기와 AI 코드 검증기 버전이 모두 같고 근거도 변경되지 않은 판정만 보존하며, 이전 AI 코드 버전은 재검증 대상으로 돌립니다.
+
 같은 문서 버전에 끝난 수동 검토(`reviewed_at` 존재)는 자동 재검증으로 덮어쓰지 않습니다. 그러나 수집 본문의 hash가 바뀌어 새 `web_document`가 현재 버전이 되면 크롤러가 이전 판정·검수 메타데이터를 초기화합니다. 새 버전은 자동 판정과 필요한 수동 검토를 다시 통과해야 합니다.
 
-### 4. `REVIEW_REQUIRED` 수동 검토
+### 4. `REVIEW_REQUIRED` AI 보조 검증
 
-자동 판정의 근거가 부족한 원문은 반드시 사람이 검토합니다. 기본 실행은 후보를 읽기만 하며 DB를 바꾸지 않습니다.
+AI 보조 검증은 결정적 검증기가 `REVIEW_REQUIRED`로 남긴 현재 문서만 대상으로 합니다. 기본 실행은 후보 계획만 출력하며 게이트웨이를 호출하거나 DB를 변경하지 않습니다.
+
+```bash
+python etl/ai_review_policy_sources.py --limit 10 --show-url
+```
+
+개인 `.env`에 `LITELLM_API_KEY`, `LITELLM_BASE_URL`, 팀에서 허용한 `LITELLM_CHAT_MODEL` 별칭을 설정한 뒤 한 건부터 shadow 실행합니다. 모델 별칭은 임베딩 별칭과 별개이며 코드가 임의로 추측하지 않습니다.
+
+```bash
+python etl/ai_review_policy_sources.py --shadow --limit 1 --write
+python etl/ai_review_policy_sources.py --show-observations --limit 20
+```
+
+`--shadow --write`의 쓰기는 `policy_web_ai_review` 관찰 저장만 뜻합니다. AI는 폐쇄형 JSON으로 페이지 유형·정책 정체성·기관·지역·신청기간·고유어의 직접 인용과 충돌·종료 표시를 추출할 뿐 최종 상태를 쓰지 않습니다. 코드는 모든 인용을 저장된 제목·H1·heading·본문에서 다시 찾고 API 정책값과 비교합니다. 정확한 단일 정책 정체성과 서로 독립적인 근거 2종 이상이 있고, 충돌·다중 정책·종료 표시·검증 실패 근거가 하나도 없어야 `VERIFIED`를 제안합니다. 입력 한도를 넘는 본문은 잘라 판단하지 않고 실패 관찰로 남깁니다.
+
+관찰 적용은 UUID 하나를 명시해야 합니다. 먼저 dry-run으로 저장 제안을 확인한 뒤 `--write`를 붙입니다.
+
+```bash
+python etl/ai_review_policy_sources.py --apply-review-id <AI_REVIEW_UUID>
+python etl/ai_review_policy_sources.py --apply-review-id <AI_REVIEW_UUID> --write
+```
+
+적용 트랜잭션은 활성 정책, 현재 문서 ID와 `content_hash`, 정책 근거 hash, 미검토 `REVIEW_REQUIRED` 관계를 잠그고 저장된 JSON을 현재 코드로 다시 검증합니다. stale 관찰, 이미 적용한 관찰, 근거가 부족한 제안, 사람 검토가 끝난 관계는 거부합니다. `REJECTED` 제안은 대상 정책번호가 없고 다른 정책명이 제목·H1·개별 heading에서 직접 확인된 경우로 제한합니다. AI 적용은 사람 검수 필드인 `reviewed_by`, `reviewed_at`을 채우지 않습니다.
+
+### 5. `REVIEW_REQUIRED` 수동 검토
+
+AI 보조 검증 뒤에도 근거가 부족하거나 판정이 의심스러운 원문은 사람이 검토합니다. 기본 실행은 후보를 읽기만 하며 DB를 바꾸지 않습니다.
 
 ```bash
 python etl/review_policy_sources.py --limit 20 --show-url
@@ -221,6 +256,8 @@ python etl/review_policy_sources.py \
 출력된 정책·원문·문서 버전·판정이 정확할 때만 같은 명령에 `--write`를 붙입니다. 해당 문서가 아직 최신이고, 활성 정책의 활성·미검토 `REVIEW_REQUIRED` 관계일 때만 판정이 저장됩니다. 동일 정책-URL이 복수 관계 유형으로 연결돼 있으면 모두 한 트랜잭션으로 적용되며 일부만 바뀌지 않습니다.
 
 수동 판정은 `policy_web_source`의 검수 메타데이터만 바꾸며 `policy`, `policy_chunk`, `web_document` 본문을 수정하지 않습니다. `VERIFIED`만 검증 View와 이후 웹 청크 입력에 노출됩니다. `REJECTED`와 `LINK_ONLY`는 기록은 보존하지만 웹 청크를 생성하지 않습니다.
+
+AI 적용과 수동 판정은 모두 관계 상태까지만 바꿉니다. `VERIFIED`가 새로 생긴 뒤에는 `generate_policy_web_chunks.py`, `embed_policy_web_chunks.py`, `sync_rag_retrieval_chunks.py`를 별도로 실행해야 검색 projection에 반영됩니다.
 
 ## 누락 필드 우선순위
 
@@ -259,13 +296,14 @@ ORDER BY field_name;
 
 `web_document`의 행 수와 검증 View의 행 수는 같을 필요가 없습니다. 수집은 성공했지만 정책과의 관련성이 부족한 원문은 staging에만 남는 것이 정상입니다.
 
-## 별도 웹 청크·임베딩과 RAG fallback
+## 별도 원천 청크와 통합 RAG 검색 projection
 
-API 원천과 크롤링 원천은 끝까지 분리합니다.
+API 원천과 크롤링 원천은 끝까지 분리하고 검색용 파생 계층에서만 합칩니다.
 
 ```text
-API:      policy → policy_chunk → 1차 검색
-크롤링:   web_document → policy_web_chunk → 부족할 때만 2차 검색
+API:      policy → policy_chunk ──────────────┐
+                                               ├→ rag_retrieval_chunk → 단일 검색
+크롤링:   web_document → policy_web_chunk ────┘
 ```
 
 `generate_policy_web_chunks.py`는 `v_verified_policy_web_document`만 읽고 `policy_web_chunk`만 갱신합니다. `embed_policy_web_chunks.py`도 검증 View에 남아 있는 웹 청크만 임베딩하며 `policy`나 `policy_chunk`를 수정하지 않습니다.
@@ -276,12 +314,15 @@ python etl/generate_policy_web_chunks.py --write
 
 python etl/embed_policy_web_chunks.py
 python etl/embed_policy_web_chunks.py --write
+
+python etl/sync_rag_retrieval_chunks.py
+python etl/sync_rag_retrieval_chunks.py --write
 ```
 
-RAG는 먼저 API 기반 검색을 수행하고, 선택된 정책에서 필요한 정보가 부족할 때만 같은 `policy_no` 범위의 `v_verified_policy_web_chunk`를 fallback으로 검색합니다. 웹 검색 결과에는 `source_type = CRAWLED_WEB`, 원문 URL, `document_id`가 포함됩니다. 웹 청크를 전체 정책 추천의 1차 후보 생성에 사용하지 않습니다.
+publish ETL은 활성 정책의 정상 API 임베딩과 `v_verified_policy_web_chunk`에 노출되는 정상 웹 임베딩만 `rag_retrieval_chunk`에 복사합니다. 질문 임베딩과 동일한 모델을 대상으로 HNSW 검색을 한 번 수행하며, RDB 조건으로 얻은 후보 `policy_no`를 반드시 전달합니다. 결과에는 `source_type`, 원문 URL, `document_id`가 포함되므로 API와 웹의 권위·출처를 후단에서 구분할 수 있습니다. `source_priority`는 정책별 그룹화와 context 구성에 사용하고 벡터 거리식 자체를 바꾸지는 않습니다.
 
 ```sql
--- :candidate_policy_nos는 API/RDB 단계에서 이미 선택된 정책 번호 배열
+-- :candidate_policy_nos는 RDB 단계에서 이미 선택된 정책 번호 배열
 SELECT
     policy_no,
     document_id,
@@ -289,23 +330,22 @@ SELECT
     COALESCE(final_url, canonical_url) AS source_url,
     content,
     1 - (embedding <=> :query_embedding::vector) AS similarity
-FROM v_verified_policy_web_chunk
+FROM rag_retrieval_chunk
 WHERE policy_no = ANY(:candidate_policy_nos)
-  AND embedding IS NOT NULL
   AND embedding_model = :embedding_model
 ORDER BY embedding <=> :query_embedding::vector
 LIMIT :limit;
 ```
 
-검증되지 않은 `web_document`, `PENDING`, `REVIEW_REQUIRED`, `REJECTED`, `LINK_ONLY` 관계를 웹 청크 생성 입력으로 사용하면 안 됩니다. 웹 청크가 변경되어도 API 기반 `policy_chunk` 임베딩은 그대로 유지됩니다.
+검증되지 않은 `web_document`, `PENDING`, `REVIEW_REQUIRED`, `REJECTED`, `LINK_ONLY` 관계를 웹 청크 생성이나 검색 projection 입력으로 사용하면 안 됩니다. 웹 청크가 변경되어도 API 기반 `policy_chunk` 임베딩은 그대로 유지됩니다. 승인 취소·문서 교체 뒤에는 publish ETL을 같은 운영 작업 안에서 실행하여 과거 projection 행을 제거해야 합니다.
 
-## 2026-10-31 로컬 검증 스냅샷
+## 2026-11-06 로컬 검증 스냅샷
 
 - 정책 3,708건, 활성 3,664건, API `policy_chunk` 14,647건
-- 현재 `web_document` 13건, 검증 원문 4건
-- `policy_web_chunk` 6건, 모두 `bedrock-titan-embed-v2` 임베딩 완료, 벡터 차원 1024
-- 미검토 `REVIEW_REQUIRED` 0건
-- 소스 상태: `DISCOVERED` 2,949 / `FETCHED` 13 / `UNSUPPORTED` 3 / `BLOCKED` 5
-- 활성 관계 상태: `PENDING` 4,478 / `VERIFIED` 4 / `LINK_ONLY` 14 / `REJECTED` 1
+- `web_document` 전체 27건, 현재 문서 23건, 검증된 현재 원문 8건
+- `policy_web_chunk` 6건, 기존 binary Titan V2 1024차원 임베딩 6건
+- AI 관찰 14건: `FAILED` 1건, `REVIEW_REQUIRED` 제안 8건, `VERIFIED` 제안 5건이며 그중 4건을 파일럿 적용
+- 소스 상태: `DISCOVERED` 2,939 / `FETCHED` 23 / `UNSUPPORTED` 3 / `BLOCKED` 5
+- 활성 관계 상태: `PENDING` 4,468 / `REVIEW_REQUIRED` 6 / `VERIFIED` 8 / `LINK_ONLY` 14 / `REJECTED` 1
 
-이 스냅샷의 크롤링 결과와 임베딩은 별도 웹 계층에만 있으며 API `policy`와 `policy_chunk`를 수정하지 않았습니다.
+이 스냅샷의 크롤링 결과와 임베딩은 별도 웹 계층에만 있으며 API `policy`와 `policy_chunk`를 수정하지 않았습니다. 새로 `VERIFIED`가 된 원문 4건의 웹 청크 생성과 float 임베딩은 전체 float 전환 작업까지 보류합니다. 남은 `REVIEW_REQUIRED` 6건은 종료·일몰 표시, 독립 근거 부족 또는 반복 판정 불안정 때문에 자동 적용하지 않습니다.

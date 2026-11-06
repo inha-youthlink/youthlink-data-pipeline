@@ -1,11 +1,11 @@
 # YouthLink 정책 Chunk 생성 전략
 
-작성 기준: 2026-10-31
+작성 기준: 2026-11-06
 Chunker 버전: `policy-v1`
 
 ## 1. 목적
 
-온통청년 API에서 적재한 `policy`의 정형·비정형 데이터를 검색에 적합한 의미 단위 텍스트로 변환하여 `policy_chunk`에 저장합니다. 이 테이블은 API 원천 전용이며 크롤링 데이터는 합치지 않습니다. 크롤링 원문은 검증 후 별도 `policy_web_chunk`에 저장하고 RAG의 2차 fallback으로만 사용합니다. 이번 단계는 API 청크 텍스트 생성까지를 다루며, 임베딩 생성은 별도 파이프라인에서 수행합니다.
+온통청년 API에서 적재한 `policy`의 정형·비정형 데이터를 검색에 적합한 의미 단위 텍스트로 변환하여 `policy_chunk`에 저장합니다. 이 테이블은 API 원천 전용이며 크롤링 데이터는 합치지 않습니다. 크롤링 원문은 검증 후 별도 `policy_web_chunk`에 저장합니다. 두 원천의 임베딩이 완료되면 파생 테이블 `rag_retrieval_chunk`에 발행하여 RAG가 단일 HNSW 인덱스를 검색합니다. 이번 단계는 API 청크 텍스트 생성까지를 다루며, 임베딩과 통합 검색 발행은 별도 파이프라인에서 수행합니다.
 
 ## 2. 실제 데이터 분석 결과
 
@@ -114,5 +114,5 @@ token_count = NULL
 → 변경 청크의 임베딩 무효화
 ```
 
-임베딩 API 호출과 pgvector 검색은 별도의 `etl/embed_policy_chunks.py`, `etl/search_policy_chunks.py`가 담당합니다. 실행 방법은 [임베딩 및 pgvector 검색 파이프라인](embedding-pipeline.md)을 참고합니다.
+임베딩 API 호출은 `etl/embed_policy_chunks.py`가 담당하고, 두 원천의 검색 projection 발행과 단일 pgvector 검색은 `etl/sync_rag_retrieval_chunks.py`, `etl/search_rag_chunks.py`가 담당합니다. API 원천만 확인할 때는 `etl/search_policy_chunks.py`를 사용합니다. 실행 방법은 [임베딩 및 pgvector 검색 파이프라인](embedding-pipeline.md)을 참고합니다.
 

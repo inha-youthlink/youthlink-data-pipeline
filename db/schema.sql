@@ -588,6 +588,199 @@ COMMENT ON CONSTRAINT fk_policy_web_source_validated_source_document
 CREATE INDEX IF NOT EXISTS idx_policy_web_source_validated_document
     ON policy_web_source (validated_document_id);
 
+CREATE TABLE IF NOT EXISTS policy_web_ai_review (
+    ai_review_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    policy_no             VARCHAR(30) NOT NULL,
+    source_id             UUID NOT NULL,
+    document_id           UUID NOT NULL,
+    content_hash          VARCHAR(64) NOT NULL,
+    policy_evidence_hash  VARCHAR(64) NOT NULL,
+    previous_status       VARCHAR(30) NOT NULL DEFAULT 'REVIEW_REQUIRED',
+
+    model                 VARCHAR(100) NOT NULL,
+    prompt_version        VARCHAR(100) NOT NULL,
+    reviewer_version      VARCHAR(100) NOT NULL,
+    execution_status      VARCHAR(30) NOT NULL,
+
+    page_type             VARCHAR(30),
+    identity_result       VARCHAR(30),
+    raw_response          JSONB,
+    identity_evidence     JSONB NOT NULL DEFAULT '[]'::jsonb,
+    supporting_evidence   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    conflicting_evidence  JSONB NOT NULL DEFAULT '[]'::jsonb,
+    lifecycle_flags       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    rejected_evidence     JSONB NOT NULL DEFAULT '[]'::jsonb,
+
+    proposed_status       VARCHAR(30),
+    proposed_score        NUMERIC(5, 4),
+    verification_result   VARCHAR(30),
+    failure_reason        TEXT NOT NULL,
+    input_token_count     INTEGER,
+    output_token_count    INTEGER,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    applied_at            TIMESTAMPTZ,
+    metadata              JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+    CONSTRAINT fk_policy_web_ai_review_policy
+        FOREIGN KEY (policy_no)
+        REFERENCES policy (policy_no)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_policy_web_ai_review_source_document
+        FOREIGN KEY (source_id, document_id)
+        REFERENCES web_document (source_id, document_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT chk_policy_web_ai_review_content_hash
+        CHECK (content_hash ~ '^[0-9a-f]{64}$'),
+
+    CONSTRAINT chk_policy_web_ai_review_policy_evidence_hash
+        CHECK (policy_evidence_hash ~ '^[0-9a-f]{64}$'),
+
+    CONSTRAINT chk_policy_web_ai_review_previous_status
+        CHECK (previous_status = 'REVIEW_REQUIRED'),
+
+    CONSTRAINT chk_policy_web_ai_review_versions
+        CHECK (
+            BTRIM(model) <> ''
+            AND BTRIM(prompt_version) <> ''
+            AND BTRIM(reviewer_version) <> ''
+        ),
+
+    CONSTRAINT chk_policy_web_ai_review_execution_status
+        CHECK (execution_status IN ('SUCCEEDED', 'FAILED', 'INVALID_OUTPUT')),
+
+    CONSTRAINT chk_policy_web_ai_review_page_type
+        CHECK (
+            page_type IS NULL
+            OR page_type IN (
+                'DETAIL_SINGLE', 'LISTING_MULTI', 'PORTAL',
+                'ERROR_OR_EMPTY', 'UNKNOWN'
+            )
+        ),
+
+    CONSTRAINT chk_policy_web_ai_review_identity_result
+        CHECK (
+            identity_result IS NULL
+            OR identity_result IN ('EXACT', 'CONFLICT', 'INSUFFICIENT')
+        ),
+
+    CONSTRAINT chk_policy_web_ai_review_json_arrays
+        CHECK (
+            jsonb_typeof(identity_evidence) = 'array'
+            AND jsonb_typeof(supporting_evidence) = 'array'
+            AND jsonb_typeof(conflicting_evidence) = 'array'
+            AND jsonb_typeof(lifecycle_flags) = 'array'
+            AND jsonb_typeof(rejected_evidence) = 'array'
+        ),
+
+    CONSTRAINT chk_policy_web_ai_review_raw_response
+        CHECK (raw_response IS NULL OR jsonb_typeof(raw_response) = 'object'),
+
+    CONSTRAINT chk_policy_web_ai_review_proposed_status
+        CHECK (
+            proposed_status IS NULL
+            OR proposed_status IN ('VERIFIED', 'REVIEW_REQUIRED', 'REJECTED')
+        ),
+
+    CONSTRAINT chk_policy_web_ai_review_proposed_score
+        CHECK (
+            proposed_score IS NULL
+            OR (proposed_score >= 0.0 AND proposed_score <= 1.0)
+        ),
+
+    CONSTRAINT chk_policy_web_ai_review_verification_result
+        CHECK (
+            verification_result IS NULL
+            OR verification_result IN ('ACCEPTED', 'INSUFFICIENT')
+        ),
+
+    CONSTRAINT chk_policy_web_ai_review_execution_state
+        CHECK (
+            (
+                execution_status = 'SUCCEEDED'
+                AND page_type IS NOT NULL
+                AND identity_result IS NOT NULL
+                AND raw_response IS NOT NULL
+                AND proposed_status IS NOT NULL
+                AND proposed_score IS NOT NULL
+                AND (
+                    (
+                        proposed_status IN ('VERIFIED', 'REJECTED')
+                        AND verification_result = 'ACCEPTED'
+                    )
+                    OR (
+                        proposed_status = 'REVIEW_REQUIRED'
+                        AND verification_result = 'INSUFFICIENT'
+                    )
+                )
+            )
+            OR (
+                execution_status IN ('FAILED', 'INVALID_OUTPUT')
+                AND page_type IS NULL
+                AND identity_result IS NULL
+                AND proposed_status IS NULL
+                AND proposed_score IS NULL
+                AND verification_result IS NULL
+                AND jsonb_array_length(identity_evidence) = 0
+                AND jsonb_array_length(supporting_evidence) = 0
+                AND jsonb_array_length(conflicting_evidence) = 0
+                AND jsonb_array_length(lifecycle_flags) = 0
+                AND jsonb_array_length(rejected_evidence) = 0
+            )
+        ),
+
+    CONSTRAINT chk_policy_web_ai_review_failure_reason
+        CHECK (BTRIM(failure_reason) <> ''),
+
+    CONSTRAINT chk_policy_web_ai_review_token_counts
+        CHECK (
+            (input_token_count IS NULL OR input_token_count >= 0)
+            AND (output_token_count IS NULL OR output_token_count >= 0)
+        ),
+
+    CONSTRAINT chk_policy_web_ai_review_metadata
+        CHECK (jsonb_typeof(metadata) = 'object'),
+
+    CONSTRAINT chk_policy_web_ai_review_applied_state
+        CHECK (
+            applied_at IS NULL
+            OR (
+                execution_status = 'SUCCEEDED'
+                AND proposed_status IN ('VERIFIED', 'REJECTED')
+                AND verification_result = 'ACCEPTED'
+            )
+        )
+);
+
+CREATE INDEX IF NOT EXISTS idx_policy_web_ai_review_target
+    ON policy_web_ai_review (policy_no, source_id, document_id, created_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_policy_web_ai_review_success_cache
+    ON policy_web_ai_review (
+        policy_no,
+        source_id,
+        document_id,
+        content_hash,
+        policy_evidence_hash,
+        model,
+        prompt_version,
+        reviewer_version
+    )
+    WHERE execution_status = 'SUCCEEDED';
+
+CREATE INDEX IF NOT EXISTS idx_policy_web_ai_review_unapplied
+    ON policy_web_ai_review (proposed_status, created_at)
+    WHERE execution_status = 'SUCCEEDED'
+      AND verification_result = 'ACCEPTED'
+      AND applied_at IS NULL;
+
+COMMENT ON TABLE policy_web_ai_review IS
+    'Append-only AI evidence observations for exact REVIEW_REQUIRED document versions; canonical decisions require guarded application.';
+
+COMMENT ON COLUMN policy_web_ai_review.raw_response IS
+    'Parsed JSON returned by the model. It is untrusted until the code verifier accepts exact quotes against the stored document.';
+
 CREATE TABLE IF NOT EXISTS policy_enrichment_fact (
     fact_id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     policy_no              VARCHAR(30) NOT NULL,
@@ -861,6 +1054,149 @@ COMMENT ON TABLE policy_web_chunk IS
 
 COMMENT ON VIEW v_verified_policy_web_chunk IS
     'Current verified crawled-web chunks safe for policy-scoped fallback retrieval.';
+
+-- API and verified web sources stay independent above. This disposable
+-- projection publishes their completed embeddings into one physical HNSW
+-- index so the RAG path needs only one vector search.
+CREATE TABLE IF NOT EXISTS rag_retrieval_chunk (
+    retrieval_chunk_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    policy_no             VARCHAR(30) NOT NULL,
+    source_type           VARCHAR(30) NOT NULL,
+
+    policy_chunk_id       UUID,
+    web_chunk_id          UUID,
+    document_id           UUID,
+    source_id             UUID,
+    canonical_url         TEXT,
+    final_url             TEXT,
+    source_fetched_at     TIMESTAMPTZ,
+
+    chunk_index           INTEGER NOT NULL,
+    chunk_type            VARCHAR(30) NOT NULL,
+    heading               TEXT,
+    content               TEXT NOT NULL,
+    content_hash          VARCHAR(64) NOT NULL,
+    chunker_version       VARCHAR(50) NOT NULL,
+
+    embedding             VECTOR(1024) NOT NULL,
+    embedding_model       VARCHAR(100) NOT NULL,
+    token_count           INTEGER,
+    embedded_at           TIMESTAMPTZ NOT NULL,
+
+    source_updated_at     TIMESTAMPTZ NOT NULL,
+    source_priority       SMALLINT NOT NULL,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT fk_rag_retrieval_chunk_policy
+        FOREIGN KEY (policy_no)
+        REFERENCES policy (policy_no)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_rag_retrieval_chunk_policy_chunk
+        FOREIGN KEY (policy_chunk_id)
+        REFERENCES policy_chunk (chunk_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_rag_retrieval_chunk_web_chunk
+        FOREIGN KEY (web_chunk_id)
+        REFERENCES policy_web_chunk (web_chunk_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_rag_retrieval_chunk_document
+        FOREIGN KEY (document_id)
+        REFERENCES web_document (document_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_rag_retrieval_chunk_source
+        FOREIGN KEY (source_id)
+        REFERENCES web_source (source_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT uq_rag_retrieval_chunk_policy_chunk
+        UNIQUE (policy_chunk_id),
+
+    CONSTRAINT uq_rag_retrieval_chunk_web_chunk
+        UNIQUE (web_chunk_id),
+
+    CONSTRAINT chk_rag_retrieval_chunk_origin
+        CHECK (
+            (
+                source_type = 'API'
+                AND policy_chunk_id IS NOT NULL
+                AND web_chunk_id IS NULL
+                AND document_id IS NULL
+                AND source_id IS NULL
+                AND canonical_url IS NULL
+                AND final_url IS NULL
+                AND source_fetched_at IS NULL
+            )
+            OR
+            (
+                source_type = 'CRAWLED_WEB'
+                AND policy_chunk_id IS NULL
+                AND web_chunk_id IS NOT NULL
+                AND document_id IS NOT NULL
+                AND source_id IS NOT NULL
+                AND canonical_url IS NOT NULL
+                AND BTRIM(canonical_url) <> ''
+                AND source_fetched_at IS NOT NULL
+                AND (final_url IS NULL OR BTRIM(final_url) <> '')
+            )
+        ),
+
+    CONSTRAINT chk_rag_retrieval_chunk_type
+        CHECK (
+            (
+                source_type = 'API'
+                AND chunk_type IN (
+                    'SUMMARY', 'ELIGIBILITY', 'SUPPORT', 'APPLICATION'
+                )
+            )
+            OR
+            (
+                source_type = 'CRAWLED_WEB'
+                AND chunk_type = 'WEB_TEXT'
+            )
+        ),
+
+    CONSTRAINT chk_rag_retrieval_chunk_index
+        CHECK (chunk_index >= 0),
+
+    CONSTRAINT chk_rag_retrieval_chunk_content
+        CHECK (BTRIM(content) <> ''),
+
+    CONSTRAINT chk_rag_retrieval_chunk_content_hash
+        CHECK (content_hash ~ '^[0-9a-f]{64}$'),
+
+    CONSTRAINT chk_rag_retrieval_chunk_chunker
+        CHECK (BTRIM(chunker_version) <> ''),
+
+    CONSTRAINT chk_rag_retrieval_chunk_model
+        CHECK (BTRIM(embedding_model) <> ''),
+
+    CONSTRAINT chk_rag_retrieval_chunk_token_count
+        CHECK (token_count IS NULL OR token_count >= 0),
+
+    CONSTRAINT chk_rag_retrieval_chunk_priority
+        CHECK (source_priority BETWEEN 0 AND 1000)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rag_retrieval_chunk_policy_source
+    ON rag_retrieval_chunk (policy_no, source_type);
+
+CREATE INDEX IF NOT EXISTS idx_rag_retrieval_chunk_embedding_hnsw
+    ON rag_retrieval_chunk
+    USING hnsw (embedding vector_cosine_ops);
+
+COMMENT ON TABLE rag_retrieval_chunk IS
+    'Disposable single-index RAG projection of active API chunks and current verified crawled-web chunks.';
+
+COMMENT ON COLUMN rag_retrieval_chunk.source_type IS
+    'Origin corpus: API or CRAWLED_WEB.';
+
+COMMENT ON COLUMN rag_retrieval_chunk.source_priority IS
+    'Source-aware reranking priority; similarity remains the primary retrieval signal.';
 
 CREATE TABLE IF NOT EXISTS chat_room (
     room_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),

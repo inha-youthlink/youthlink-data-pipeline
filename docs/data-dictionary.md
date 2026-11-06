@@ -1,6 +1,6 @@
 # YouthLink 데이터 사전
 
-작성 기준: 2026-10-31
+작성 기준: 2026-11-06
 
 이 문서는 YouthLink PostgreSQL 스키마의 테이블과 컬럼 의미를 설명합니다. 테이블 간 관계를 그림으로 확인하려면 [erd.md](erd.md)를 참고하세요. 실제 정의의 기준은 `db/schema.sql`과 `db/migrations/`입니다.
 
@@ -9,7 +9,7 @@
 - **한 행의 의미**는 해당 테이블의 튜플(row) 하나가 무엇을 나타내는지 설명합니다.
 - `PK`는 기본키, `FK`는 외래키, `UNIQUE`는 중복 방지 제약조건입니다.
 - 외부 API 코드에는 의도적으로 FK를 강제하지 않은 경우가 있습니다. 신규·과거 코드 때문에 정책 수집 전체가 실패하지 않게 하기 위함입니다.
-- 최종 프로젝트 구조는 18개 테이블과 6개 조회용 View입니다.
+- 최종 프로젝트 구조는 22개 테이블과 6개 조회용 View입니다. pgvector 설치 확인용 `vector_test`는 프로젝트 테이블 수에 포함하지 않습니다.
 
 ## 전체 구성
 
@@ -27,8 +27,10 @@
 | 웹 원문 | `web_source` | 정규화한 원문 URL과 HTTP 수집 상태 |
 | 웹 원문 | `policy_web_source` | 정책-URL 관계와 관련성 검증 상태 |
 | 웹 원문 | `web_document` | 수집한 원문 본문의 버전별 staging |
+| 웹 원문 검증 | `policy_web_ai_review` | `REVIEW_REQUIRED` 문서의 AI 근거 추출·코드 재검증 관찰 이력 |
 | 웹 원문 | `policy_enrichment_fact` | 원문에서 추출한 필드값·직접 근거·검증 상태 |
 | 웹 원문 RAG | `policy_web_chunk` | 검증된 크롤링 원문 전용 fallback 청크·임베딩 |
+| 통합 RAG 검색 | `rag_retrieval_chunk` | 활성 API 청크와 현재 검증 웹 청크의 재생성 가능한 단일 검색 projection |
 | 채팅 | `chat_room` | 대화방 |
 | 채팅 | `chat_profile` | 대화방별 사용자 프로필 |
 | 채팅 | `chat_message` | 대화 메시지 |
@@ -453,6 +455,44 @@ PK는 `(policy_no, source_id, relation_type)`입니다. 새 연결은 반드시 
 
 ---
 
+## `policy_web_ai_review`
+
+**한 행의 의미:** 정확한 활성 정책과 `REVIEW_REQUIRED` 문서 버전 하나를 대상으로 AI가 추출한 근거를 코드가 다시 검증한 관찰 하나.
+
+| 컬럼 | 타입 | 용도 |
+| --- | --- | --- |
+| `ai_review_id` | `UUID` | AI 검토 관찰 식별자, PK |
+| `policy_no` | `VARCHAR(30)` | 대상 정책, `policy` FK |
+| `source_id`, `document_id` | `UUID` | 대상 출처와 정확한 문서 버전, `web_document` 복합 FK |
+| `content_hash` | `VARCHAR(64)` | 관찰한 문서 제목·heading·본문의 SHA-256 |
+| `policy_evidence_hash` | `VARCHAR(64)` | 모델 입력과 코드 검증에 사용한 API 정책 근거의 SHA-256 |
+| `previous_status` | `VARCHAR(30)` | 관찰 시 관계 상태, 항상 `REVIEW_REQUIRED` |
+| `model` | `VARCHAR(100)` | 사용한 LiteLLM chat 모델 별칭 |
+| `prompt_version`, `reviewer_version` | `VARCHAR(100)` | 근거 추출 prompt와 코드 재검증 규칙 버전 |
+| `execution_status` | `VARCHAR(30)` | `SUCCEEDED`, `FAILED`, `INVALID_OUTPUT` |
+| `page_type` | `VARCHAR(30)` | 단일 상세·목록·포털·오류·불명 분류 |
+| `identity_result` | `VARCHAR(30)` | 정책 정체성의 `EXACT`, `CONFLICT`, `INSUFFICIENT` 판정 |
+| `raw_response` | `JSONB` | 폐쇄형 스키마로 파싱된 모델 응답. 그 자체는 신뢰하지 않음 |
+| `identity_evidence` | `JSONB` | 저장 원문에서 확인된 정책번호·정책명 직접 인용 배열 |
+| `supporting_evidence` | `JSONB` | API 정책값과 일치한 기관·지역·신청기간·고유어 직접 인용 배열 |
+| `conflicting_evidence` | `JSONB` | 저장 원문에서 확인된 충돌 근거 배열 |
+| `lifecycle_flags` | `JSONB` | 종료·마감·대체·과거 모집 표시 근거 배열 |
+| `rejected_evidence` | `JSONB` | 원문 부재·값 불일치 등 코드 검증에서 거부한 모델 근거 배열 |
+| `proposed_status` | `VARCHAR(30)` | 코드가 계산한 `VERIFIED`, `REVIEW_REQUIRED`, `REJECTED` 제안 |
+| `proposed_score` | `NUMERIC(5,4)` | 제안의 보조 점수, 0~1 |
+| `verification_result` | `VARCHAR(30)` | 코드 적용 가능 여부. 현재 `ACCEPTED` 또는 `INSUFFICIENT` |
+| `failure_reason` | `TEXT` | 검증 차단 또는 호출·출력 실패 사유 |
+| `input_token_count`, `output_token_count` | `INTEGER` | 게이트웨이 응답의 실제 사용량 |
+| `created_at` | `TIMESTAMPTZ` | 관찰 저장 시각 |
+| `applied_at` | `TIMESTAMPTZ` | 이 관찰 UUID를 관계 상태에 명시적으로 적용한 시각 |
+| `metadata` | `JSONB` | 관계 유형, 입력 완전성, 입력 문자 수 등 비민감 실행 메타데이터 |
+
+AI는 `policy_web_source`를 직접 갱신하지 않습니다. `--shadow --write`는 이 테이블에 관찰만 저장합니다. 성공 관찰의 캐시 키에는 정책·출처·문서·문서 hash·정책 근거 hash·모델·prompt·검증기 버전이 모두 포함되므로, 문서나 API 정책 근거가 바뀌면 과거 결과를 재사용하지 않습니다. 실패·잘못된 출력 관찰은 감사용으로 남기되 성공 캐시를 막지 않아 다시 시도할 수 있습니다.
+
+`--apply-review-id`의 명시적 적용 단계는 현재 문서와 정책 근거를 잠근 뒤 저장된 `raw_response`를 다시 파싱·검증합니다. 적용 가능한 `VERIFIED` 또는 대상 정책번호가 없고 다른 정책명이 제목·H1·개별 heading에 직접 인용된 제한적 `REJECTED`만 원자적으로 반영하며, `reviewed_by`와 `reviewed_at`은 사람 검수 전용으로 남깁니다. 이후 `revalidate_policy_sources.py`는 적용 관찰의 정책 근거 hash를 현재 값과 비교해 정책 API·지역 해석이 바뀐 판정을 `REVIEW_REQUIRED`로 되돌립니다. 관찰이 적용되어도 웹 청크·임베딩·통합 검색 projection은 별도 ETL에서 갱신합니다.
+
+---
+
 ## `policy_enrichment_fact`
 
 **한 행의 의미:** 검증 대상 원문에서 별도로 관측·추출한 필드값 하나와 그 값을 직접 뒷받침하는 문장·구간.
@@ -502,7 +542,35 @@ PK는 `(policy_no, source_id, relation_type)`입니다. 새 연결은 반드시 
 | `embedding_error` | `TEXT` | 마지막 임베딩 실패 요약 |
 | `created_at`, `updated_at` | `TIMESTAMPTZ` | 생성·변경 시각 |
 
-이 테이블은 `policy_chunk`와 FK나 갱신 관계가 없습니다. `policy_no`만 같은 정책 안에서 2차 검색 범위를 제한하기 위해 공유합니다. `generate_policy_web_chunks.py`와 `embed_policy_web_chunks.py`는 이 테이블만 쓰며 API 기반 `policy`·`policy_chunk`는 수정하지 않습니다.
+이 테이블은 `policy_chunk`와 FK나 갱신 관계가 없습니다. `policy_no`와 원문 문서 계보를 보존하며, `generate_policy_web_chunks.py`와 `embed_policy_web_chunks.py`는 이 테이블만 쓰고 API 기반 `policy`·`policy_chunk`는 수정하지 않습니다. 임베딩이 완료된 현재 검증 행은 후속 publish ETL에서 `rag_retrieval_chunk`로 복사됩니다.
+
+---
+
+## `rag_retrieval_chunk`
+
+**한 행의 의미:** RAG의 단일 pgvector 검색에 발행된 API 정책 청크 또는 현재 검증 웹 청크 하나.
+
+이 테이블은 원본이 아니라 `policy_chunk`와 `v_verified_policy_web_chunk`에서 언제든 재생성할 수 있는 검색용 projection입니다. 두 원천의 본문과 기존 Titan V2 벡터를 복사하므로 publish 과정에서 임베딩 API를 호출하지 않습니다.
+
+| 컬럼 | 타입 | 용도 |
+| --- | --- | --- |
+| `retrieval_chunk_id` | `UUID` | 통합 검색 행 식별자, PK |
+| `policy_no` | `VARCHAR(30)` | RDB 후보 정책 필터와 그룹화에 사용하는 `policy` FK |
+| `source_type` | `VARCHAR(30)` | `API` 또는 `CRAWLED_WEB` |
+| `policy_chunk_id` | `UUID` | API 원천일 때의 `policy_chunk` FK·UNIQUE |
+| `web_chunk_id` | `UUID` | 웹 원천일 때의 `policy_web_chunk` FK·UNIQUE |
+| `document_id`, `source_id` | `UUID` | 웹 원문 버전과 URL 출처 계보. API 행에서는 `NULL` |
+| `canonical_url`, `final_url` | `TEXT` | 웹 정규 URL과 최종 응답 URL. API 행에서는 `NULL` |
+| `source_fetched_at` | `TIMESTAMPTZ` | 웹 원문 수집 시각 |
+| `chunk_index`, `chunk_type`, `heading` | `INTEGER`, `VARCHAR(30)`, `TEXT` | 원본 청크의 순서·유형·제목 |
+| `content`, `content_hash`, `chunker_version` | `TEXT`, `VARCHAR(64)`, `VARCHAR(50)` | 검색 본문과 변경 감지·생성기 정보 |
+| `embedding` | `VECTOR(1024)` | 단일 HNSW 인덱스가 사용하는 기존 원천 벡터의 복사본 |
+| `embedding_model`, `token_count`, `embedded_at` | `VARCHAR(100)`, `INTEGER`, `TIMESTAMPTZ` | 임베딩 계보와 참고 토큰 수 |
+| `source_updated_at` | `TIMESTAMPTZ` | 원본 청크의 마지막 변경 시각 |
+| `source_priority` | `SMALLINT` | 후단 source-aware 그룹화·재정렬용 우선순위 |
+| `created_at`, `updated_at` | `TIMESTAMPTZ` | projection 행 생성·갱신 시각 |
+
+원천 ID는 정확히 하나만 채워집니다. `API` 행은 `policy_chunk_id`만, `CRAWLED_WEB` 행은 `web_chunk_id`와 문서·URL 계보만 가집니다. 동기화 ETL은 활성 정책의 정상 임베딩과 `v_verified_policy_web_chunk`에 현재 노출되는 정상 임베딩만 발행하고, 비활성화·승인 취소·문서 교체로 원천 집합에서 사라진 행은 같은 정책 범위에서 제거합니다. RAG는 프로필로 얻은 후보 `policy_no`를 전달해 이 테이블의 HNSW 인덱스를 한 번 검색하고, 결과의 `source_type`과 URL을 보존해야 합니다.
 
 ---
 
@@ -568,7 +636,7 @@ PK는 `(policy_no, source_id, relation_type)`입니다. 새 연결은 반드시 
 - UNIQUE: `(room_id, client_message_id)`. 키는 대화방 안에서만 유일하면 되고, 답변 행은 `NULL`이라 제약에 걸리지 않습니다.
 - 질문은 답변 생성 전에 저장하므로 연결이 끊기거나 생성이 실패하면 답변 없는 질문이 남습니다. 그래서 질문과 답변의 짝은 메시지 순서가 아니라 `reply_to_message_id`로 찾습니다.
 - 질문 하나에 답변 하나는 백엔드가 지킵니다. 답변 다시 생성 같은 기능을 막지 않도록 유일 제약은 두지 않습니다.
-- 메시지 순서는 `message_id`로 보장합니다. 009 이전 답변의 `reply_to_message_id`는 마이그레이션에서 바로 앞 질문으로 채웁니다.
+- 메시지 순서는 `message_id`로 보장합니다. `015_converge_chat_schema.sql` 적용 전에 저장된 답변의 `reply_to_message_id`는 바로 앞 메시지가 같은 방의 사용자 질문인 경우에만 보수적으로 채웁니다.
 
 ---
 
@@ -748,7 +816,7 @@ RAG나 후속 필드 추출기가 원문 본문을 사용할 때 `web_document`�
 - 정책-URL 연결이 활성 상태이고 `VERIFIED`
 - `validated_document_id`가 청크의 `document_id`와 일치
 
-`source_type`은 `CRAWLED_WEB`로 고정됩니다. RAG는 API 기반 `policy_chunk`를 먼저 사용한 뒤 필요한 정보가 부족할 때만 같은 `policy_no` 범위에서 이 View를 검색합니다.
+`source_type`은 `CRAWLED_WEB`로 고정됩니다. 이 View는 통합 publish ETL의 웹 입력 경계이며, RAG의 운영 검색은 여기와 `policy_chunk`에서 발행된 `rag_retrieval_chunk`를 사용합니다.
 
 ---
 

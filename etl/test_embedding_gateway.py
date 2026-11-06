@@ -44,7 +44,7 @@ def main() -> int:
 
     print(
         "embedding gateway test passed: "
-        f"model={model}, dimensions={len(vectors[0])}, "
+        f"model={model}, dimensions={len(vectors[0])}, format=float, "
         f"usage_tokens={usage_tokens}"
     )
     return 0

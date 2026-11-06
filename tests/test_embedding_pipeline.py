@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from etl.backfill_embedding_token_estimates import calculate_updates
 from etl.embedding_utils import (
     DEFAULT_EMBEDDING_DIMENSIONS,
+    DEFAULT_EMBEDDING_ENCODING_FORMAT,
     DEFAULT_EMBEDDING_MODEL,
     create_embedding_client,
     estimate_token_count,
@@ -60,6 +61,7 @@ class EmbeddingUtilsTests(unittest.TestCase):
     def test_defaults_use_titan_gateway_alias_and_1024_dimensions(self):
         self.assertEqual(DEFAULT_EMBEDDING_MODEL, "bedrock-titan-embed-v2")
         self.assertEqual(DEFAULT_EMBEDDING_DIMENSIONS, 1024)
+        self.assertEqual(DEFAULT_EMBEDDING_ENCODING_FORMAT, "float")
 
     def test_gateway_client_rejects_missing_or_relative_base_url(self):
         with self.assertRaisesRegex(ValueError, "API key"):
@@ -87,8 +89,8 @@ class EmbeddingUtilsTests(unittest.TestCase):
     def test_request_embeddings_restores_input_order_and_usage(self):
         response = SimpleNamespace(
             data=[
-                SimpleNamespace(index=1, embedding=[0.8, -0.6]),
-                SimpleNamespace(index=0, embedding=[0.6, 0.8]),
+                SimpleNamespace(index=1, embedding=[-0.25, 0.75]),
+                SimpleNamespace(index=0, embedding=[0.125, -0.5]),
             ],
             usage=SimpleNamespace(prompt_tokens=7),
         )
@@ -98,10 +100,11 @@ class EmbeddingUtilsTests(unittest.TestCase):
             client, ["첫째", "둘째"], model="test-model", dimensions=2
         )
 
-        self.assertEqual(vectors, [[0.6, 0.8], [0.8, -0.6]])
+        self.assertEqual(vectors, [[0.125, -0.5], [-0.25, 0.75]])
         self.assertEqual(tokens, 7)
         self.assertEqual(client.embeddings.calls[0]["input"], ["첫째", "둘째"])
         self.assertEqual(client.embeddings.calls[0]["model"], "test-model")
+        self.assertEqual(client.embeddings.calls[0]["encoding_format"], "float")
         self.assertNotIn("dimensions", client.embeddings.calls[0])
 
     def test_request_embeddings_asks_for_float_encoding(self):
@@ -131,7 +134,7 @@ class EmbeddingUtilsTests(unittest.TestCase):
 
     def test_request_embeddings_accepts_total_tokens_usage(self):
         response = SimpleNamespace(
-            data=[SimpleNamespace(index=0, embedding=[0.6, 0.8])],
+            data=[SimpleNamespace(index=0, embedding=[0.1, -0.2])],
             usage=SimpleNamespace(total_tokens=3),
         )
         client = SimpleNamespace(embeddings=FakeEmbeddings(response))

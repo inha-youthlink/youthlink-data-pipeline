@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 DEFAULT_EMBEDDING_MODEL = "bedrock-titan-embed-v2"
 DEFAULT_EMBEDDING_DIMENSIONS = 1024
+DEFAULT_EMBEDDING_ENCODING_FORMAT = "float"
 _RETRY_SECONDS_RE = re.compile(
     r"try again in\s+([0-9]+(?:\.[0-9]+)?)\s*(ms|s)",
     re.IGNORECASE,
@@ -98,21 +99,14 @@ def request_embeddings(
     if not texts:
         return [], 0
 
-    # The capstone gateway fixes bedrock-titan-embed-v2 at 1024 dimensions.
-    # Do not send the provider-specific dimensions option: the documented
-    # OpenAI-compatible request accepts only model and input. We still verify
-    # every returned vector below so a gateway configuration mismatch fails
-    # before anything reaches pgvector.
-    #
-    # encoding_format must be explicit. The OpenAI SDK sends "base64" when it
-    # is omitted, and the gateway maps that to Titan's binary output, so every
-    # dimension arrives as 0 or 1 instead of a float. Binary vectors keep only
-    # about 1/32 of the information and compress cosine scores into a narrow
-    # band, which breaks retrieval ranking.
+    # The gateway alias fixes bedrock-titan-embed-v2 at 1024 dimensions, so do
+    # not send the provider-specific dimensions option. Request float values
+    # explicitly because the same alias previously returned binary 0/1 values
+    # when the output format was omitted. Validate every result before storage.
     response = client.embeddings.create(
         input=list(texts),
         model=model,
-        encoding_format="float",
+        encoding_format=DEFAULT_EMBEDDING_ENCODING_FORMAT,
     )
     data = sorted(response.data, key=lambda item: item.index)
     if len(data) != len(texts):

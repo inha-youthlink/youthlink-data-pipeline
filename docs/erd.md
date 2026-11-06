@@ -178,6 +178,26 @@ erDiagram
         timestamp fetched_at
     }
 
+    POLICY_WEB_AI_REVIEW {
+        uuid ai_review_id PK
+        varchar policy_no FK
+        uuid source_id FK
+        uuid document_id FK
+        varchar content_hash
+        varchar policy_evidence_hash
+        varchar model
+        varchar execution_status
+        varchar page_type
+        varchar identity_result
+        jsonb identity_evidence
+        jsonb supporting_evidence
+        jsonb conflicting_evidence
+        varchar proposed_status
+        varchar verification_result
+        timestamp created_at
+        timestamp applied_at
+    }
+
     POLICY_ENRICHMENT_FACT {
         uuid fact_id PK
         varchar policy_no FK
@@ -199,6 +219,21 @@ erDiagram
         varchar content_hash
         varchar chunker_version
         vector embedding
+    }
+
+    RAG_RETRIEVAL_CHUNK {
+        uuid retrieval_chunk_id PK
+        varchar policy_no FK
+        varchar source_type
+        uuid policy_chunk_id FK
+        uuid web_chunk_id FK
+        uuid document_id FK
+        uuid source_id FK
+        varchar chunk_type
+        text content
+        vector embedding
+        varchar embedding_model
+        smallint source_priority
     }
 
     CHAT_ROOM {
@@ -264,10 +299,15 @@ erDiagram
     WEB_SOURCE ||--o{ POLICY_WEB_SOURCE : "linked from policy"
     WEB_SOURCE ||--o{ WEB_DOCUMENT : "versioned as"
     WEB_DOCUMENT o|--o{ POLICY_WEB_SOURCE : "validated against"
+    POLICY ||--o{ POLICY_WEB_AI_REVIEW : "reviewed against"
+    WEB_DOCUMENT ||--o{ POLICY_WEB_AI_REVIEW : "observed exactly"
     POLICY ||--o{ POLICY_ENRICHMENT_FACT : "has separate web evidence"
     WEB_DOCUMENT ||--o{ POLICY_ENRICHMENT_FACT : "supports fact"
     POLICY ||--o{ POLICY_WEB_CHUNK : "scopes fallback"
     WEB_DOCUMENT ||--o{ POLICY_WEB_CHUNK : "chunked separately"
+    POLICY ||--o{ RAG_RETRIEVAL_CHUNK : "retrieved as"
+    POLICY_CHUNK ||--o| RAG_RETRIEVAL_CHUNK : "published as API"
+    POLICY_WEB_CHUNK ||--o| RAG_RETRIEVAL_CHUNK : "published as web"
 
     CHAT_ROOM ||--o| CHAT_PROFILE : "has"
     CHAT_ROOM ||--o{ CHAT_MESSAGE : "contains"
@@ -296,11 +336,13 @@ erDiagram
 
 ### RAG domain
 - `policy_chunk`
+- `rag_retrieval_chunk`
 
 ### Web-source staging and verification domain
 - `web_source`
 - `policy_web_source`
 - `web_document`
+- `policy_web_ai_review`
 - `policy_enrichment_fact`
 - `policy_web_chunk`
 
@@ -376,7 +418,7 @@ flowchart LR
 
 ## 검증형 정책 원문 흐름
 
-원문 테이블은 수집 staging과 사용 승인을 분리합니다. `web_document`에 본문이 저장되어도 정책-URL 관계가 `VERIFIED`가 아니면 검증 View에 나타나지 않습니다. 개별 관측 사실은 관계와 사실이 모두 검증되어야 노출됩니다. 크롤링 텍스트는 API 기반 `policy_chunk`와 합치지 않고 `policy_web_chunk`에 별도로 저장합니다.
+원문 테이블은 수집 staging과 사용 승인을 분리합니다. `web_document`에 본문이 저장되어도 정책-URL 관계가 `VERIFIED`가 아니면 검증 View에 나타나지 않습니다. `policy_web_ai_review`는 `REVIEW_REQUIRED` 문서의 AI 근거 추출과 코드 재검증을 별도 관찰로 보존하며, shadow 저장만으로 관계를 승인하지 않습니다. 개별 관측 사실은 관계와 사실이 모두 검증되어야 노출됩니다. 크롤링 텍스트는 API 기반 `policy_chunk`와 합치지 않고 `policy_web_chunk`에 별도로 저장한 뒤, 검색용 projection에서만 API 청크와 함께 발행합니다.
 
 ```mermaid
 flowchart LR
@@ -384,15 +426,21 @@ flowchart LR
     SOURCE["web_source<br/>정규화 URL·수집 상태"]
     LINK["policy_web_source<br/>PENDING / VERIFIED / REVIEW_REQUIRED<br/>REJECTED / LINK_ONLY"]
     DOC["web_document<br/>버전별 staging 본문"]
+    AI_REVIEW["policy_web_ai_review<br/>AI 직접 인용·코드 재검증 관찰"]
     FACT["policy_enrichment_fact<br/>값·직접 근거·검증 상태"]
     WEB_CHUNK["policy_web_chunk<br/>별도 fallback 청크·벡터"]
     VERIFIED_DOC["v_verified_policy_web_document<br/>검증된 최신 원문"]
     VERIFIED_FACT["v_verified_policy_enrichment<br/>검증된 보강 사실"]
     VERIFIED_CHUNK["v_verified_policy_web_chunk<br/>검증된 fallback 청크"]
+    API_CHUNK["policy_chunk<br/>API 청크·벡터"]
+    RETRIEVAL["rag_retrieval_chunk<br/>단일 HNSW 검색 projection"]
 
     POLICY --> LINK
     SOURCE --> LINK
     SOURCE --> DOC
+    POLICY --> AI_REVIEW
+    DOC --> AI_REVIEW
+    AI_REVIEW -.->|"관찰 UUID 명시 + stale 재검증"| LINK
     DOC --> FACT
     DOC --> WEB_CHUNK
     POLICY --> FACT
@@ -406,6 +454,8 @@ flowchart LR
     LINK -->|"활성 + VERIFIED"| VERIFIED_CHUNK
     DOC -->|"현재 검증 문서"| VERIFIED_CHUNK
     WEB_CHUNK --> VERIFIED_CHUNK
+    API_CHUNK -->|"활성 + 임베딩 완료"| RETRIEVAL
+    VERIFIED_CHUNK -->|"현재 검증 + 임베딩 완료"| RETRIEVAL
 ```
 
-RAG·백엔드는 staging 테이블을 직접 읽지 않고 검증 View를 사용합니다. 정책-URL 판정은 `validated_document_id`로 검사한 문서 버전에 고정되므로 같은 URL의 내용이 바뀌면 이전 승인이 새 본문에 자동 적용되지 않습니다. RAG는 API 기반 `policy_chunk`를 1차로 검색하고 정보가 부족할 때만 같은 `policy_no`의 `v_verified_policy_web_chunk`를 2차 fallback으로 사용합니다. `policy`와 `policy_chunk`는 크롤링 파이프라인이 수정하지 않습니다.
+RAG·백엔드는 staging 테이블과 AI 관찰 테이블을 직접 읽지 않습니다. 정책-URL 판정은 `validated_document_id`로 검사한 문서 버전에 고정되므로 같은 URL의 내용이 바뀌면 이전 승인이 새 본문에 자동 적용되지 않습니다. AI 관찰 적용도 현재 문서 hash와 API 정책 근거 hash를 다시 확인하고 저장된 직접 인용을 현재 코드로 재검증합니다. 이후 저장 문서 재검증은 적용 당시 정책 근거 hash와 현재 값을 비교해 정책 API·지역 해석이 달라진 AI 판정을 `REVIEW_REQUIRED`로 되돌립니다. publish ETL은 활성 `policy_chunk`와 현재 `v_verified_policy_web_chunk`의 기존 벡터를 `rag_retrieval_chunk`에 복사하고, RAG는 RDB 후보 정책 범위에서 이 단일 HNSW 인덱스를 검색합니다. `source_type`과 원문 URL은 context까지 보존하며, `policy`와 `policy_chunk`는 크롤링 파이프라인이 수정하지 않습니다.
