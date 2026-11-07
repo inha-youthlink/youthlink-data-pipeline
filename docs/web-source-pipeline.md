@@ -339,13 +339,15 @@ LIMIT :limit;
 
 검증되지 않은 `web_document`, `PENDING`, `REVIEW_REQUIRED`, `REJECTED`, `LINK_ONLY` 관계를 웹 청크 생성이나 검색 projection 입력으로 사용하면 안 됩니다. 웹 청크가 변경되어도 API 기반 `policy_chunk` 임베딩은 그대로 유지됩니다. 승인 취소·문서 교체 뒤에는 publish ETL을 같은 운영 작업 안에서 실행하여 과거 projection 행을 제거해야 합니다.
 
-## 2026-11-06 로컬 검증 스냅샷
+## 2026-11-07 로컬 검증 스냅샷
 
 - 정책 3,708건, 활성 3,664건, API `policy_chunk` 14,647건
-- `web_document` 전체 27건, 현재 문서 23건, 검증된 현재 원문 8건
+- `web_document` 전체 30건, 현재 문서 26건, 검증된 현재 원문 9건
 - `policy_web_chunk` 6건, 기존 binary Titan V2 1024차원 임베딩 6건
-- AI 관찰 14건: `FAILED` 1건, `REVIEW_REQUIRED` 제안 8건, `VERIFIED` 제안 5건이며 그중 4건을 파일럿 적용
-- 소스 상태: `DISCOVERED` 2,939 / `FETCHED` 23 / `UNSUPPORTED` 3 / `BLOCKED` 5
-- 활성 관계 상태: `PENDING` 4,468 / `REVIEW_REQUIRED` 6 / `VERIFIED` 8 / `LINK_ONLY` 14 / `REJECTED` 1
+- AI 관찰 18건: `FAILED` 1건, `REVIEW_REQUIRED` 제안 12건, `VERIFIED` 제안 5건이며 그중 4건을 파일럿 적용
+- 소스 상태: `DISCOVERED` 2,933 / `FETCHED` 26 / `UNSUPPORTED` 6 / `BLOCKED` 5
+- 활성 관계 상태: `PENDING` 4,463 / `REVIEW_REQUIRED` 10 / `VERIFIED` 9 / `LINK_ONLY` 14 / `REJECTED` 1
 
-이 스냅샷의 크롤링 결과와 임베딩은 별도 웹 계층에만 있으며 API `policy`와 `policy_chunk`를 수정하지 않았습니다. 새로 `VERIFIED`가 된 원문 4건의 웹 청크 생성과 float 임베딩은 전체 float 전환 작업까지 보류합니다. 남은 `REVIEW_REQUIRED` 6건은 종료·일몰 표시, 독립 근거 부족 또는 반복 판정 불안정 때문에 자동 적용하지 않습니다.
+이 스냅샷의 크롤링 결과와 임베딩은 별도 웹 계층에만 있으며 API `policy`와 `policy_chunk`를 수정하지 않았습니다. 기존 웹 청크에 아직 반영하지 않은 검증 원문 5건의 청크 생성과 float 임베딩은 전체 float 전환 작업까지 보류합니다. 남은 `REVIEW_REQUIRED` 10건은 종료·일몰 표시, 독립 근거 부족, API와 원문 기관값 충돌 또는 반복 판정 불안정 때문에 자동 적용하지 않습니다.
+
+2026-11-07 도메인 파일럿에서는 `youth.gwangju.go.kr` 3건이 모두 HTTP 200과 약 55KB HTML을 반환했지만 정책 본문이 없는 공용 경로 또는 JavaScript shell이어서 `INSUFFICIENT_TEXT`·`UNSUPPORTED`로 종료됐습니다. 같은 URL을 반복 요청하거나 도메인 전용 자동 승인을 추가하지 않았습니다. `youth.incheon.go.kr` 3건은 모두 상세 본문 수집에 성공했고 5개 정책 관계 중 결정적 근거가 충분한 1개만 `VERIFIED`, 나머지 4개는 `REVIEW_REQUIRED`가 됐습니다. 4개 모두 AI shadow에서도 독립 근거 부족, 미검증 모델 근거 또는 API·페이지 기관값 충돌로 보류됐습니다. 전체 현재 문서 재검증 계획은 `stale_ai=0`, `documents=0`이었습니다.
