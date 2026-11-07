@@ -20,6 +20,31 @@ erDiagram
         timestamp finished_at
     }
 
+    SCHEMA_MIGRATION {
+        varchar migration_name PK
+        varchar checksum_sha256
+        timestamp applied_at
+        integer execution_ms
+    }
+
+    POLICY_PIPELINE_JOB {
+        uuid pipeline_job_id PK
+        varchar status
+        varchar current_step
+        uuid resumed_from_job_id FK
+        timestamp started_at
+        timestamp finished_at
+    }
+
+    POLICY_PIPELINE_STEP {
+        uuid pipeline_step_id PK
+        uuid pipeline_job_id FK
+        varchar step_name
+        smallint step_order
+        varchar status
+        integer exit_code
+    }
+
     POLICY {
         varchar policy_no PK
         varchar policy_name
@@ -142,6 +167,7 @@ erDiagram
         text content
         vector embedding
         varchar embedding_model
+        varchar embedding_encoding_format
         timestamp created_at
     }
 
@@ -219,6 +245,7 @@ erDiagram
         varchar content_hash
         varchar chunker_version
         vector embedding
+        varchar embedding_encoding_format
     }
 
     RAG_RETRIEVAL_CHUNK {
@@ -233,6 +260,7 @@ erDiagram
         text content
         vector embedding
         varchar embedding_model
+        varchar embedding_encoding_format
         smallint source_priority
     }
 
@@ -320,6 +348,8 @@ erDiagram
     POLICY ||--o{ CHAT_CURRENT_POLICY : "focused in"
 
     POLICY ||--o{ POLICY_SCRAP : "scrapped as"
+    POLICY_PIPELINE_JOB ||--o{ POLICY_PIPELINE_STEP : "records"
+    POLICY_PIPELINE_JOB |o--o{ POLICY_PIPELINE_JOB : "resumes"
 ```
 
 ## Table groups
@@ -333,6 +363,11 @@ erDiagram
 - `region_code_mapping`
 - `policy_eligibility_code`
 - `common_code`
+
+### Operations domain
+- `schema_migration`
+- `policy_pipeline_job`
+- `policy_pipeline_step`
 
 ### RAG domain
 - `policy_chunk`

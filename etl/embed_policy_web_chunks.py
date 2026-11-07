@@ -13,6 +13,7 @@ from psycopg.rows import dict_row
 try:
     from .embedding_utils import (
         DEFAULT_EMBEDDING_DIMENSIONS,
+        DEFAULT_EMBEDDING_ENCODING_FORMAT,
         DEFAULT_EMBEDDING_MODEL,
         create_embedding_client,
         estimate_token_count,
@@ -24,6 +25,7 @@ try:
 except ImportError:  # Direct execution: python etl/embed_policy_web_chunks.py
     from embedding_utils import (
         DEFAULT_EMBEDDING_DIMENSIONS,
+        DEFAULT_EMBEDDING_ENCODING_FORMAT,
         DEFAULT_EMBEDDING_MODEL,
         create_embedding_client,
         estimate_token_count,
@@ -76,9 +78,10 @@ def load_candidates(
     params: list[Any] = []
     if not force:
         conditions.append(
-            "(chunk.embedding IS NULL OR chunk.embedding_model IS DISTINCT FROM %s)"
+            "(chunk.embedding IS NULL OR chunk.embedding_model IS DISTINCT FROM %s "
+            "OR chunk.embedding_encoding_format IS DISTINCT FROM %s)"
         )
-        params.append(model)
+        params.extend([model, DEFAULT_EMBEDDING_ENCODING_FORMAT])
     if not retry_errors and not force:
         conditions.append("chunk.embedding_error IS NULL")
     if policy_nos:
@@ -158,6 +161,7 @@ def store_success(
         (
             vector_literal(vector, EMBEDDING_DIMENSIONS),
             model,
+            DEFAULT_EMBEDDING_ENCODING_FORMAT,
             candidate.token_count,
             candidate.web_chunk_id,
         )
@@ -169,6 +173,7 @@ def store_success(
             UPDATE policy_web_chunk
             SET embedding = %s::vector,
                 embedding_model = %s,
+                embedding_encoding_format = %s,
                 token_count = %s,
                 embedded_at = NOW(),
                 embedding_error = NULL,
@@ -190,7 +195,12 @@ def store_failure(
         cur.executemany(
             """
             UPDATE policy_web_chunk
-            SET embedding_error = %s,
+            SET embedding = NULL,
+                embedding_model = NULL,
+                embedding_encoding_format = NULL,
+                token_count = NULL,
+                embedded_at = NULL,
+                embedding_error = %s,
                 updated_at = NOW()
             WHERE web_chunk_id = %s
             """,

@@ -588,6 +588,29 @@ def _load_locked_policy(
     return PolicyEvidence.from_mapping(row)
 
 
+def enforce_same_name_version_safety(
+    *,
+    decision: str,
+    policy_no: str,
+    same_name_sibling_policy_nos: Sequence[str],
+    identity_evidence: Sequence[Mapping[str, Any]],
+) -> None:
+    """Block ambiguous VERIFIED applies unless the page proves the target ID."""
+    if decision != "VERIFIED" or not same_name_sibling_policy_nos:
+        return
+    exact_policy_number = any(
+        item.get("kind") == "POLICY_NUMBER"
+        and str(item.get("value") or "").casefold() == policy_no.casefold()
+        for item in identity_evidence
+    )
+    if not exact_policy_number:
+        raise RuntimeError(
+            "Automatic VERIFIED apply is blocked because multiple active "
+            "policies with the same name share this source and the page "
+            "does not prove the exact target policy number"
+        )
+
+
 def apply_ai_observation(
     conn: psycopg.Connection[Any],
     *,
@@ -623,6 +646,31 @@ def apply_ai_observation(
         source = cur.fetchone()
         if source is None:
             raise RuntimeError("The observation web source no longer exists")
+
+        cur.execute(
+            """
+            SELECT sibling_policy.policy_no
+            FROM policy_web_source AS sibling_link
+            JOIN policy AS sibling_policy
+              ON sibling_policy.policy_no = sibling_link.policy_no
+             AND sibling_policy.is_active = TRUE
+            WHERE sibling_link.source_id = %s
+              AND sibling_link.is_active = TRUE
+              AND sibling_link.policy_no <> %s
+              AND LOWER(BTRIM(sibling_policy.policy_name))
+                  = LOWER(BTRIM(%s))
+            ORDER BY sibling_policy.policy_no
+            FOR SHARE OF sibling_policy
+            """,
+            (
+                snapshot["source_id"],
+                snapshot["policy_no"],
+                policy.policy_name,
+            ),
+        )
+        same_name_sibling_policy_nos = tuple(
+            row["policy_no"] for row in cur.fetchall()
+        )
 
         cur.execute(
             """
@@ -718,6 +766,12 @@ def apply_ai_observation(
         raise RuntimeError("Fresh verification requires human review")
 
     decision = verification.proposed_status
+    enforce_same_name_version_safety(
+        decision=decision,
+        policy_no=policy.policy_no,
+        same_name_sibling_policy_nos=same_name_sibling_policy_nos,
+        identity_evidence=verification.identity_evidence,
+    )
     matched_addition = ["ai_evidence_verified"] if decision == "VERIFIED" else []
     conflicting_addition = ["ai_evidence_rejected"] if decision == "REJECTED" else []
     with conn.cursor() as cur:

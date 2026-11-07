@@ -12,6 +12,7 @@ from etl.ai_review_policy_sources import (
     AiReviewCandidate,
     apply_ai_observation,
     build_messages,
+    enforce_same_name_version_safety,
     load_ai_review_candidates,
     main,
     parse_args,
@@ -359,6 +360,30 @@ class ApplySafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "successful"):
             apply_ai_observation(conn, ai_review_id=uuid4())
 
+    def test_same_name_versions_block_verified_without_exact_number(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "same name"):
+            enforce_same_name_version_safety(
+                decision="VERIFIED",
+                policy_no="P-2026",
+                same_name_sibling_policy_nos=("P-2025",),
+                identity_evidence=(
+                    {
+                        "kind": "POLICY_NAME",
+                        "value": "국제기구 직업체험 프로그램",
+                    },
+                ),
+            )
+
+    def test_same_name_versions_allow_verified_with_exact_number(self) -> None:
+        enforce_same_name_version_safety(
+            decision="VERIFIED",
+            policy_no="P-2026",
+            same_name_sibling_policy_nos=("P-2025",),
+            identity_evidence=(
+                {"kind": "POLICY_NUMBER", "value": "P-2026"},
+            ),
+        )
+
     def test_success_is_reverified_and_does_not_claim_human_review(self) -> None:
         item = candidate()
         review_id = uuid4()
@@ -414,6 +439,7 @@ class ApplySafetyTests(unittest.TestCase):
                 [snapshot],
                 [policy_row],
                 [source_row],
+                [],
                 [document_row],
                 [link_row],
                 [snapshot],

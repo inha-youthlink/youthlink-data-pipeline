@@ -11,6 +11,7 @@ from psycopg.rows import dict_row
 try:
     from .embedding_utils import (
         DEFAULT_EMBEDDING_DIMENSIONS,
+        DEFAULT_EMBEDDING_ENCODING_FORMAT,
         DEFAULT_EMBEDDING_MODEL,
         create_embedding_client,
         request_embeddings,
@@ -19,6 +20,7 @@ try:
 except ImportError:  # Direct execution: python etl/search_policy_chunks.py
     from embedding_utils import (
         DEFAULT_EMBEDDING_DIMENSIONS,
+        DEFAULT_EMBEDDING_ENCODING_FORMAT,
         DEFAULT_EMBEDDING_MODEL,
         create_embedding_client,
         request_embeddings,
@@ -52,8 +54,9 @@ def search_chunks(
         "p.is_active = TRUE",
         "pc.embedding IS NOT NULL",
         "pc.embedding_model = %s",
+        "pc.embedding_encoding_format = %s",
     ]
-    params: list[Any] = [model]
+    params: list[Any] = [model, DEFAULT_EMBEDDING_ENCODING_FORMAT]
     if policy_nos:
         conditions.append("pc.policy_no = ANY(%s)")
         params.append(list(policy_nos))

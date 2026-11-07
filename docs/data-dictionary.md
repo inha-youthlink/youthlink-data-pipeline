@@ -1,6 +1,6 @@
 # YouthLink 데이터 사전
 
-작성 기준: 2026-11-06
+작성 기준: 2026-11-07
 
 이 문서는 YouthLink PostgreSQL 스키마의 테이블과 컬럼 의미를 설명합니다. 테이블 간 관계를 그림으로 확인하려면 [erd.md](erd.md)를 참고하세요. 실제 정의의 기준은 `db/schema.sql`과 `db/migrations/`입니다.
 
@@ -9,13 +9,16 @@
 - **한 행의 의미**는 해당 테이블의 튜플(row) 하나가 무엇을 나타내는지 설명합니다.
 - `PK`는 기본키, `FK`는 외래키, `UNIQUE`는 중복 방지 제약조건입니다.
 - 외부 API 코드에는 의도적으로 FK를 강제하지 않은 경우가 있습니다. 신규·과거 코드 때문에 정책 수집 전체가 실패하지 않게 하기 위함입니다.
-- 최종 프로젝트 구조는 22개 테이블과 6개 조회용 View입니다. pgvector 설치 확인용 `vector_test`는 프로젝트 테이블 수에 포함하지 않습니다.
+- 최종 프로젝트 구조는 25개 테이블과 6개 조회용 View입니다. 과거 pgvector 설치 확인용 `vector_test`는 제거했습니다.
 
 ## 전체 구성
 
 | 영역 | 객체 | 역할 |
 | --- | --- | --- |
 | 정책 | `policy_sync_job` | 온통청년 전체 동기화 실행과 비활성화 적용 이력 |
+| 운영 | `schema_migration` | canonical migration 체크섬·적용 이력 |
+| 운영 | `policy_pipeline_job` | 통합 정책 pipeline 실행·실패 재개 이력 |
+| 운영 | `policy_pipeline_step` | 통합 작업의 단계별 상태·출력 tail |
 | 정책 | `policy` | 온통청년 정책 본문과 정형 조건 |
 | 정책 | `policy_application_period` | 정책별 정확한 단일·복수 신청 기간 |
 | 정책 | `policy_region` | 정책과 온통청년 원본 지역코드 연결 |
@@ -69,6 +72,14 @@
 | `metadata` | `JSONB` | 향후 실행 부가정보 |
 
 미수신 정책 비활성화는 전체 순회 완료, 양수·일관된 API 총건수, 처리·성공·고유 정책 수 일치, 실패 0건을 모두 만족한 실행에서만 적용합니다. 빈 응답이나 중간 오류는 기존 정책을 비활성화하지 않습니다.
+
+---
+
+## 운영 이력 테이블
+
+`schema_migration`은 canonical migration 파일명, SHA-256, 적용 시각과 실행 시간을 저장합니다. `apply_migrations.py`는 중복 번호가 있는 과거 chat 파일을 replay하지 않고 015 수렴 migration을 포함한 명시적 순서를 사용하며, 기록된 파일의 체크섬이 달라지면 실행을 중단합니다.
+
+`policy_pipeline_job`은 정책 동기화부터 최종 검증까지의 통합 실행 하나를 나타냅니다. `status`, `current_step`, `resumed_from_job_id`, 시작·종료 시각, 오류와 JSON 요약을 저장합니다. `policy_pipeline_step`은 `POLICY_SYNC`, `POLICY_CHUNKS`, `POLICY_EMBEDDINGS`, `RAG_PUBLISH`, `VERIFY` 각 단계의 순서·상태·종료 코드·출력 tail을 저장합니다. PostgreSQL advisory lock은 동시에 두 통합 작업이 실행되는 것을 막습니다.
 
 ---
 
@@ -347,6 +358,7 @@ RAG 문맥이나 UI에는 숫자 코드보다 `code_name`을 사용합니다. �
 | `token_count` | `INTEGER` | 외부 토크나이저가 필요 없는 문자 기반 참고 추정치. 임베딩 전에는 `NULL` |
 | `embedding` | `VECTOR(1024)` | 의미 검색용 임베딩 벡터 |
 | `embedding_model` | `VARCHAR(100)` | 실제 임베딩 생성 모델명. 임베딩 전에는 `NULL` |
+| `embedding_encoding_format` | `VARCHAR(20)` | 응답 벡터 형식. 성공 행은 `float`, 임베딩 전에는 `NULL` |
 | `embedded_at` | `TIMESTAMPTZ` | 임베딩 생성 완료 시각 |
 | `embedding_error` | `TEXT` | 마지막 임베딩 실패 내용. 성공 전까지 재처리 판단에 사용 |
 | `created_at` | `TIMESTAMPTZ` | 청크 생성 시각 |
@@ -360,7 +372,7 @@ RAG 문맥이나 UI에는 숫자 코드보다 `code_name`을 사용합니다. �
 - `(policy_no, chunk_type)` UNIQUE
 - `chunk_type`은 `SUMMARY`, `ELIGIBILITY`, `SUPPORT`, `APPLICATION` 중 하나입니다.
 - `content_hash`는 64자리 소문자 SHA-256 형식이고 빈 `content`는 허용하지 않습니다.
-- 임베딩 전에는 `embedding`, `embedding_model`, `embedded_at`이 모두 `NULL`이고, 성공 후에는 셋 모두 값이 있어야 합니다.
+- 임베딩 전에는 `embedding`, `embedding_model`, `embedding_encoding_format`, `embedded_at`이 모두 `NULL`이고, 성공 후에는 형식이 `float`여야 합니다.
 - `embedding IS NOT NULL`인 행에 cosine HNSW 인덱스가 적용됩니다.
 - 사용할 게이트웨이 모델 별칭은 `bedrock-titan-embed-v2`, 벡터 차원은 1024입니다.
 - `etl/generate_policy_chunks.py`가 `policy-v1` 텍스트를 생성하고, `etl/embed_policy_chunks.py`가 명시적인 `--write` 실행에서 임베딩을 적재합니다.
@@ -537,6 +549,7 @@ AI는 `policy_web_source`를 직접 갱신하지 않습니다. `--shadow --write
 | `chunker_version` | `VARCHAR(50)` | 별도 웹 청크 생성 규칙 버전 |
 | `embedding` | `VECTOR(1024)` | 웹 원문 전용 임베딩 |
 | `embedding_model` | `VARCHAR(100)` | 임베딩 모델명 |
+| `embedding_encoding_format` | `VARCHAR(20)` | 응답 벡터 형식. 검색 가능한 성공 행은 `float` |
 | `token_count` | `INTEGER` | 외부 토크나이저가 필요 없는 문자 기반 참고 추정치 |
 | `embedded_at` | `TIMESTAMPTZ` | 임베딩 성공 시각 |
 | `embedding_error` | `TEXT` | 마지막 임베딩 실패 요약 |
@@ -565,7 +578,8 @@ AI는 `policy_web_source`를 직접 갱신하지 않습니다. `--shadow --write
 | `chunk_index`, `chunk_type`, `heading` | `INTEGER`, `VARCHAR(30)`, `TEXT` | 원본 청크의 순서·유형·제목 |
 | `content`, `content_hash`, `chunker_version` | `TEXT`, `VARCHAR(64)`, `VARCHAR(50)` | 검색 본문과 변경 감지·생성기 정보 |
 | `embedding` | `VECTOR(1024)` | 단일 HNSW 인덱스가 사용하는 기존 원천 벡터의 복사본 |
-| `embedding_model`, `token_count`, `embedded_at` | `VARCHAR(100)`, `INTEGER`, `TIMESTAMPTZ` | 임베딩 계보와 참고 토큰 수 |
+| `embedding_model`, `embedding_encoding_format` | `VARCHAR(100)`, `VARCHAR(20)` | 모델과 응답 형식 계보. 형식은 `float`만 허용 |
+| `token_count`, `embedded_at` | `INTEGER`, `TIMESTAMPTZ` | 참고 토큰 수와 임베딩 완료 시각 |
 | `source_updated_at` | `TIMESTAMPTZ` | 원본 청크의 마지막 변경 시각 |
 | `source_priority` | `SMALLINT` | 후단 source-aware 그룹화·재정렬용 우선순위 |
 | `created_at`, `updated_at` | `TIMESTAMPTZ` | projection 행 생성·갱신 시각 |

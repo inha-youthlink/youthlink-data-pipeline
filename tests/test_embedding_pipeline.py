@@ -1,4 +1,5 @@
 import unittest
+import inspect
 from types import SimpleNamespace
 
 from etl.backfill_embedding_token_estimates import calculate_updates
@@ -14,8 +15,11 @@ from etl.embedding_utils import (
     suggested_retry_delay,
     vector_literal,
 )
-from etl.embed_policy_chunks import load_candidates
-from etl.embed_policy_web_chunks import load_candidates as load_web_candidates
+from etl.embed_policy_chunks import load_candidates, store_failure
+from etl.embed_policy_web_chunks import (
+    load_candidates as load_web_candidates,
+    store_failure as store_web_failure,
+)
 from etl.search_policy_chunks import search_chunks
 
 
@@ -183,6 +187,14 @@ class EmbeddingUtilsTests(unittest.TestCase):
 
 
 class VectorSearchTests(unittest.TestCase):
+    def test_failed_refresh_clears_incomplete_vector_lineage(self):
+        for function in (store_failure, store_web_failure):
+            source = inspect.getsource(function)
+            self.assertIn("embedding = NULL", source)
+            self.assertIn("embedding_model = NULL", source)
+            self.assertIn("embedding_encoding_format = NULL", source)
+            self.assertIn("embedded_at = NULL", source)
+
     def test_embedding_candidates_exclude_inactive_policies(self):
         cursor = FakeCursor([])
         conn = FakeConnection(cursor)
@@ -200,6 +212,8 @@ class VectorSearchTests(unittest.TestCase):
         self.assertIn("JOIN policy p ON p.policy_no = pc.policy_no", cursor.sql)
         self.assertIn("p.is_active = TRUE", cursor.sql)
         self.assertIn("pc.embedding IS NULL", cursor.sql)
+        self.assertIn("pc.embedding_encoding_format IS DISTINCT FROM %s", cursor.sql)
+        self.assertEqual(cursor.params[:2], ["test-model", "float"])
 
     def test_web_embedding_candidates_use_only_verified_separate_corpus(self):
         cursor = FakeCursor([])
@@ -219,6 +233,10 @@ class VectorSearchTests(unittest.TestCase):
         self.assertIn("FROM policy_web_chunk AS chunk", cursor.sql)
         self.assertIn("JOIN v_verified_policy_web_chunk AS verified", cursor.sql)
         self.assertIn("verified.policy_no = ANY(%s)", cursor.sql)
+        self.assertIn(
+            "chunk.embedding_encoding_format IS DISTINCT FROM %s", cursor.sql
+        )
+        self.assertEqual(cursor.params[:2], ["test-model", "float"])
         self.assertNotIn("FROM policy_chunk", cursor.sql)
 
     def test_search_uses_cosine_operator_and_candidate_filters(self):
@@ -247,7 +265,10 @@ class VectorSearchTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertIn("pc.embedding <=> %s::vector", cursor.sql)
         self.assertIn("p.is_active = TRUE", cursor.sql)
-        self.assertEqual(cursor.params[1:4], ["test-model", ["P1"], ["SUPPORT"]])
+        self.assertEqual(
+            cursor.params[1:5],
+            ["test-model", "float", ["P1"], ["SUPPORT"]],
+        )
         self.assertEqual(cursor.params[-1], 5)
         self.assertEqual(cursor.params[0], cursor.params[-2])
 

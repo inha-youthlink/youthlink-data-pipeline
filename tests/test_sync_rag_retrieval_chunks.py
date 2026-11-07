@@ -56,6 +56,8 @@ class RetrievalSnapshotTests(unittest.TestCase):
         self.assertIn("verified.canonical_url", sql)
         self.assertIn("verified.final_url", sql)
         self.assertIn("verified.fetched_at AS source_fetched_at", sql)
+        self.assertIn("pc.embedding_encoding_format", sql)
+        self.assertIn("verified.embedding_encoding_format", sql)
         self.assertEqual(params, [["P1", "P2"], ["P1", "P2"]])
 
         all_sql = "\n".join(
@@ -82,7 +84,7 @@ class RetrievalSnapshotTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             RuntimeError,
-            "016_add_rag_retrieval_chunks.sql",
+            "018_track_float_embedding_format.sql",
         ):
             retrieval.verify_schema(conn)
 
@@ -103,6 +105,7 @@ class RetrievalPersistenceTests(unittest.TestCase):
 
         self.assertIn("target.content_hash", predicate)
         self.assertIn("target.embedding_model", predicate)
+        self.assertIn("target.embedding_encoding_format", predicate)
         self.assertIn("target.embedded_at", predicate)
         self.assertNotIn("target.content,", predicate)
         self.assertNotIn("target.embedding,", predicate)

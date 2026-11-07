@@ -15,7 +15,11 @@ from etl.revalidate_policy_sources import (
     load_revalidation_candidates,
     parse_args,
 )
-from etl.source_relevance import PolicyEvidence, VALIDATOR_VERSION
+from etl.source_relevance import (
+    SAME_NAME_VERSION_GUARD_VERSION,
+    PolicyEvidence,
+    VALIDATOR_VERSION,
+)
 from etl.verify_ai_evidence import policy_evidence_hash
 
 
@@ -82,7 +86,8 @@ class RevalidationSelectionTests(unittest.TestCase):
         sql, params = conn.recording_cursor.executions[0]
         self.assertIn("link.validation_status = 'PENDING'", sql)
         self.assertIn("link.validator_version IS NULL", sql)
-        self.assertIn("link.validator_version NOT IN (%s, %s, %s)", sql)
+        self.assertIn("link.validator_version NOT IN (%s, %s, %s, %s)", sql)
+        self.assertIn("sibling_policy.policy_name", sql)
         self.assertIn(
             "link.validated_document_id IS DISTINCT FROM document.document_id",
             sql,
@@ -94,6 +99,8 @@ class RevalidationSelectionTests(unittest.TestCase):
                 VALIDATOR_VERSION,
                 CURRENT_AI_VALIDATOR_VERSION,
                 STALE_AI_VALIDATOR_VERSION,
+                SAME_NAME_VERSION_GUARD_VERSION,
+                SAME_NAME_VERSION_GUARD_VERSION,
                 25,
             ),
         )

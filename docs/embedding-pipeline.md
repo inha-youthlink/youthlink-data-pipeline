@@ -1,6 +1,6 @@
 # YouthLink 임베딩 및 pgvector 검색 파이프라인
 
-작성 기준: 2026-11-06
+작성 기준: 2026-11-07
 
 ## 1. 목적
 
@@ -12,7 +12,7 @@
 
 게이트웨이는 OpenAI 호환 `/v1/embeddings` API를 제공하므로 Python `openai` SDK를 사용합니다. AWS 자격증명이나 `boto3`로 Bedrock을 직접 호출하지 않습니다.
 
-> **2026-11-06 float 전환 상태:** 임베딩 요청은 이제 `encoding_format="float"`를 명시하며, 게이트웨이가 0/1로만 구성된 binary 벡터를 반환하면 DB 저장 전에 실패합니다. 기존 로컬 DB의 API 청크 14,471건, 웹 청크 6건, 통합 projection 14,477건은 아직 binary 값으로 생성된 기존 벡터입니다. 이번 설정 변경은 기존 행을 자동 변환하지 않습니다. 전체 float 재생성과 projection 재발행이 끝날 때까지 임베딩 `--write`, projection 발행과 벡터 검색을 운영 용도로 실행하지 않습니다. 새 float 일부와 기존 binary 문서 벡터를 한 인덱스에 섞어서도 안 됩니다.
+> **2026-11-07 float 전환 완료:** migration 018이 응답 형식을 `embedding_encoding_format`으로 추적하고 형식 미상 벡터를 초기화했습니다. 최신 전체 정책 pipeline까지 반영한 API 청크 15,707건, 웹 청크 10건, 통합 projection 15,717건은 모두 `float`, 1024차원이며 binary-only 잔존과 처리 오류는 0건입니다. 모델명이 같아도 형식이 `float`가 아니면 임베딩 후보에서 건너뛰지 않고, 검색·projection 발행에서도 제외합니다.
 
 ## 2. 환경변수
 
@@ -30,7 +30,7 @@ DB의 `VECTOR(1024)` 및 HNSW 인덱스와 맞추기 위해 출력 차원은 코
 
 임베딩 요청에는 `encoding_format="float"`를 반드시 넣습니다. 현재 게이트웨이 경로에서는 이 값을 생략한 요청이 모든 칸이 0 또는 1인 Titan binary 벡터를 반환한 것이 확인됐습니다. 이진 벡터는 칸마다 크기 정보가 사라져 검색 점수가 좁은 범위에 몰리므로 검색 순위가 망가집니다. 코드는 0/1로만 된 벡터를 받으면 저장 전에 오류로 멈춥니다. 질문 임베딩(백엔드)도 같은 옵션을 써야 합니다.
 
-2026-11-01 이전에 이 옵션 없이 임베딩한 현재 로컬 DB의 벡터는 이진입니다. 모델 이름이 같아 기본 실행은 건너뛰므로 문서 아래의 float 전환 체크리스트에 따라 기존 파생값을 초기화하고 전체를 다시 임베딩해야 합니다. 저장된 벡터가 이진인지는 `SELECT embedding::text FROM policy_chunk WHERE embedding IS NOT NULL LIMIT 1`로 값이 0과 1뿐인지 보면 알 수 있습니다.
+2026-11-01 이전에 이 옵션 없이 생성한 벡터는 이진이었습니다. migration 018은 기존 형식 미상 파생값만 초기화하고, 이후 성공 행에는 `embedding_encoding_format='float'`를 강제합니다. 저장된 벡터 점검 시 모델·차원뿐 아니라 이 컬럼도 함께 확인해야 합니다.
 
 DB 마이그레이션 전에 인증과 모델 권한을 한 문장으로 확인합니다. 이 명령은 DB를 읽거나 수정하지 않고 키와 벡터 원문도 출력하지 않습니다.
 
@@ -78,6 +78,9 @@ python etl/embed_policy_chunks.py --write --limit 10
 
 ```bash
 python etl/embed_policy_chunks.py --write
+
+# 공용 gateway 허용량을 확인한 경우에만 작은 병렬도 사용
+python etl/embed_policy_chunks.py --write --workers 3
 ```
 
 기본 배치 크기는 100개입니다. 게이트웨이는 입력 배열을 지원합니다. 일시적인 연결 오류, 시간 초과, rate limit, 서버 오류는 최대 8회까지 재시도합니다. API가 응답한 재시도 대기 시간이 있으면 이를 우선하고, 없으면 지수 백오프를 적용합니다. 예산 초과처럼 대기해도 해결되지 않는 오류는 재시도하지 않습니다. 최종 실패한 배치는 `embedding_error`에 오류를 기록하고 다음 배치로 진행합니다.
@@ -99,12 +102,13 @@ python etl/embed_policy_chunks.py --write --batch-size 50
 ```text
 embedding       = 1024차원 float 벡터
 embedding_model = bedrock-titan-embed-v2
+embedding_encoding_format = float
 token_count     = 문자 기반 참고용 청크 토큰 추정치
 embedded_at     = 성공 시각
 embedding_error = NULL
 ```
 
-실패한 청크는 `embedding_error`에 오류가 남습니다. 기존 정상 벡터를 다른 모델로 갱신하다 실패한 경우에는 서비스 가능한 기존 벡터를 보존하고 오류만 기록합니다.
+실패한 청크는 `embedding_error`에 오류가 남고 벡터·모델·형식·완료 시각은 함께 비워져 불완전한 상태가 검색에 섞이지 않습니다. `--retry-errors`가 이 행만 다시 처리합니다.
 
 이전 파이프라인에서 만든 `token_count`를 현재 문자 기반 추정 방식으로 맞출 때는 외부 API를 호출하지 않는 다음 명령을 사용합니다.
 
@@ -188,10 +192,11 @@ SELECT
 FROM policy_chunk pc
 JOIN policy p ON p.policy_no = pc.policy_no;
 
-SELECT embedding_model, vector_dims(embedding), COUNT(*)
+SELECT embedding_model, embedding_encoding_format,
+       vector_dims(embedding), COUNT(*)
 FROM policy_chunk
 WHERE embedding IS NOT NULL
-GROUP BY embedding_model, vector_dims(embedding);
+GROUP BY embedding_model, embedding_encoding_format, vector_dims(embedding);
 
 SELECT
     COUNT(*) FILTER (WHERE embedding IS NOT NULL) AS web_embedded,
@@ -199,10 +204,12 @@ SELECT
     COUNT(*) FILTER (WHERE embedding_error IS NOT NULL) AS web_failed
 FROM policy_web_chunk;
 
-SELECT source_type, embedding_model, vector_dims(embedding), COUNT(*)
+SELECT source_type, embedding_model, embedding_encoding_format,
+       vector_dims(embedding), COUNT(*)
 FROM rag_retrieval_chunk
-GROUP BY source_type, embedding_model, vector_dims(embedding)
-ORDER BY source_type, embedding_model;
+GROUP BY source_type, embedding_model, embedding_encoding_format,
+         vector_dims(embedding)
+ORDER BY source_type, embedding_model, embedding_encoding_format;
 ```
 
 모든 대상이 성공했다면 `active_pending`, `failed`, `web_pending`, `web_failed`가 0이어야 합니다. 비활성 정책 청크는 감사·재활성화를 위해 본문을 보존하되 비용 절감을 위해 벡터가 없어도 정상입니다.
@@ -226,22 +233,15 @@ python etl/embed_policy_web_chunks.py --write
 python etl/sync_rag_retrieval_chunks.py --write
 ```
 
-2026-10-31 로컬 검증에서는 활성 정책 청크 14,471건과 검증 웹 청크 6건이 모두 `bedrock-titan-embed-v2` 1024차원으로 저장됐고, 실패·처리 대기 대상은 0건이었습니다. 2026-11-06 publish 검증에서는 이 14,477건이 통합 projection에 발행됐고 원천 drift 0건, 재실행 변경 0건이 확인됐습니다.
+2026-11-07 로컬 검증에서는 활성 정책 청크 15,707건과 검증 웹 청크 10건이 모두 `bedrock-titan-embed-v2`, `float`, 1024차원으로 저장됐고 실패·처리 대기 대상은 0건이었습니다. 총 15,717건이 통합 projection에 발행됐고 통합 pipeline 최종 불변식 검증이 통과했습니다.
 
-## 10. binary 값에서 float 값으로 전환하는 남은 작업
+## 10. binary 값에서 float 값으로 전환한 기록
 
-설정 변경과 기존 벡터 재생성은 분리해서 진행합니다. 현재 완료된 것은 float 요청 및 응답 검증 코드뿐이며, 아래 작업은 비용과 검색 중단 범위를 확인한 뒤 별도로 수행합니다.
-
-- [ ] 전환 직전 PostgreSQL 백업 생성
-- [ ] 임베딩 예산과 작업 시간 확인 및 검색 유지보수 시간 확보
-- [ ] 전환 완료 시점까지 임베딩 write·projection publish·벡터 검색 동결
-- [ ] 게이트웨이 단건 테스트에서 1024차원 float 응답 재확인
-- [ ] 활성 `policy_chunk` 14,471건의 기존 임베딩 상태 초기화 및 전체 float 재생성
-- [ ] 검증 `policy_web_chunk` 6건의 기존 임베딩 상태 초기화 및 전체 float 재생성
-- [ ] `rag_retrieval_chunk` 14,477건을 새 float 원천 벡터로 재발행
-- [ ] 세 테이블에서 차원, 모델, NULL/오류 수와 binary-only 잔존 0건 검증
-- [ ] 실제 정책 질의와 후보 정책 제한 검색의 품질 회귀 검증
-- [ ] 필요 시 HNSW 인덱스 `REINDEX` 및 통계 `ANALYZE`
-- [ ] 팀 공유용 최신 post-float `pg_dump` 생성
-
-전환 완료 전에는 기존 binary 문서 벡터를 사용하는 검색 결과를 운영 검증 결과로 간주하지 않습니다.
+- [x] 전환 직전 `backups/youthlink_before_float_embeddings_20261107.dump` 생성
+- [x] migration 018 적용 및 형식 미상 파생 벡터 초기화
+- [x] 게이트웨이 단건 테스트에서 1024차원 float 응답 재확인
+- [x] 현재 활성 `policy_chunk` 15,707건과 검증 `policy_web_chunk` 10건 float 생성
+- [x] `rag_retrieval_chunk` 15,717건 발행
+- [x] 세 테이블의 차원·모델·형식·NULL/오류와 binary-only 잔존 0건 검증
+- [x] 실제 정책 질의와 후보 정책 제한 API+웹 검색 회귀 검증
+- [x] 통계 `ANALYZE` 및 최신 `backups/youthlink_post_float_20261107.dump` 생성

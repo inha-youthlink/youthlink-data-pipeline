@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import time
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from psycopg.rows import dict_row
 try:
     from .embedding_utils import (
         DEFAULT_EMBEDDING_DIMENSIONS,
+        DEFAULT_EMBEDDING_ENCODING_FORMAT,
         DEFAULT_EMBEDDING_MODEL,
         create_embedding_client,
         estimate_token_count,
@@ -24,6 +26,7 @@ try:
 except ImportError:  # Direct execution: python etl/embed_policy_chunks.py
     from embedding_utils import (
         DEFAULT_EMBEDDING_DIMENSIONS,
+        DEFAULT_EMBEDDING_ENCODING_FORMAT,
         DEFAULT_EMBEDDING_MODEL,
         create_embedding_client,
         estimate_token_count,
@@ -76,9 +79,10 @@ def load_candidates(
 
     if not force:
         conditions.append(
-            "(pc.embedding IS NULL OR pc.embedding_model IS DISTINCT FROM %s)"
+            "(pc.embedding IS NULL OR pc.embedding_model IS DISTINCT FROM %s "
+            "OR pc.embedding_encoding_format IS DISTINCT FROM %s)"
         )
-        params.append(model)
+        params.extend([model, DEFAULT_EMBEDDING_ENCODING_FORMAT])
     if not retry_errors and not force:
         conditions.append("pc.embedding_error IS NULL")
 
@@ -152,6 +156,7 @@ def store_success(
         (
             vector_literal(vector, EMBEDDING_DIMENSIONS),
             model,
+            DEFAULT_EMBEDDING_ENCODING_FORMAT,
             candidate.token_count,
             candidate.chunk_id,
         )
@@ -163,6 +168,7 @@ def store_success(
             UPDATE policy_chunk
             SET embedding = %s::vector,
                 embedding_model = %s,
+                embedding_encoding_format = %s,
                 token_count = %s,
                 embedded_at = NOW(),
                 embedding_error = NULL
@@ -183,7 +189,12 @@ def store_failure(
         cur.executemany(
             """
             UPDATE policy_chunk
-            SET embedding_error = %s
+            SET embedding = NULL,
+                embedding_model = NULL,
+                embedding_encoding_format = NULL,
+                token_count = NULL,
+                embedded_at = NULL,
+                embedding_error = %s
             WHERE chunk_id = %s
             """,
             [(message, candidate.chunk_id) for candidate in batch],
@@ -232,6 +243,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="re-embed every selected chunk, including valid current vectors",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="concurrent gateway requests (default: 1; use a small value)",
+    )
     args = parser.parse_args(argv)
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be greater than zero")
@@ -241,6 +258,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--max-attempts must be greater than zero")
     if args.base_delay < 0:
         parser.error("--base-delay must not be negative")
+    if args.workers <= 0:
+        parser.error("--workers must be greater than zero")
     return args
 
 
@@ -285,32 +304,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         failed = 0
         actual_tokens = 0
         batches = _batched(candidates, args.batch_size)
-        for batch_number, batch in enumerate(batches, start=1):
-            try:
-                vectors, prompt_tokens = request_with_retry(
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {
+                executor.submit(
+                    request_with_retry,
                     client,
                     [candidate.content for candidate in batch],
-                    model=EMBEDDING_MODEL,
-                    max_attempts=args.max_attempts,
-                    base_delay=args.base_delay,
-                )
-                store_success(conn, batch, vectors, EMBEDDING_MODEL)
-                succeeded += len(batch)
-                actual_tokens += prompt_tokens
-                print(
-                    f"batch {batch_number}/{len(batches)}: "
-                    f"embedded={len(batch)}, prompt_tokens={prompt_tokens}",
-                    flush=True,
-                )
-            except Exception as error:
-                conn.rollback()
-                store_failure(conn, batch, error)
-                failed += len(batch)
-                print(
-                    f"batch {batch_number}/{len(batches)} failed: "
-                    f"{type(error).__name__}: {error}",
-                    flush=True,
-                )
+                    EMBEDDING_MODEL,
+                    args.max_attempts,
+                    args.base_delay,
+                ): (batch_number, batch)
+                for batch_number, batch in enumerate(batches, start=1)
+            }
+            for future in as_completed(futures):
+                batch_number, batch = futures[future]
+                try:
+                    vectors, prompt_tokens = future.result()
+                    store_success(conn, batch, vectors, EMBEDDING_MODEL)
+                    succeeded += len(batch)
+                    actual_tokens += prompt_tokens
+                    print(
+                        f"batch {batch_number}/{len(batches)}: "
+                        f"embedded={len(batch)}, prompt_tokens={prompt_tokens}",
+                        flush=True,
+                    )
+                except Exception as error:
+                    conn.rollback()
+                    store_failure(conn, batch, error)
+                    failed += len(batch)
+                    print(
+                        f"batch {batch_number}/{len(batches)} failed: "
+                        f"{type(error).__name__}: {error}",
+                        flush=True,
+                    )
 
     print(
         f"embedding complete: succeeded={succeeded}, failed={failed}, "

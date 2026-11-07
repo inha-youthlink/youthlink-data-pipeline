@@ -327,6 +327,7 @@ def sync_web_chunks(
                             token_count = NULL,
                             embedding = NULL,
                             embedding_model = NULL,
+                            embedding_encoding_format = NULL,
                             embedded_at = NULL,
                             embedding_error = NULL,
                             updated_at = NOW()

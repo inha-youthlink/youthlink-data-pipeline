@@ -15,7 +15,11 @@ try:
         load_policy_evidence,
         store_link_validations,
     )
-    from .source_relevance import PolicyEvidence, VALIDATOR_VERSION
+    from .source_relevance import (
+        SAME_NAME_VERSION_GUARD_VERSION,
+        PolicyEvidence,
+        VALIDATOR_VERSION,
+    )
     from .verify_ai_evidence import AI_REVIEWER_VERSION, policy_evidence_hash
 except ImportError:  # Direct execution: python etl/revalidate_policy_sources.py
     from crawl_policy_sources import (
@@ -23,7 +27,11 @@ except ImportError:  # Direct execution: python etl/revalidate_policy_sources.py
         load_policy_evidence,
         store_link_validations,
     )
-    from source_relevance import PolicyEvidence, VALIDATOR_VERSION
+    from source_relevance import (
+        SAME_NAME_VERSION_GUARD_VERSION,
+        PolicyEvidence,
+        VALIDATOR_VERSION,
+    )
     from verify_ai_evidence import AI_REVIEWER_VERSION, policy_evidence_hash
 
 
@@ -366,8 +374,23 @@ def load_revalidation_candidates(
              AND policy_row.is_active = TRUE
             WHERE link.validation_status = 'PENDING'
                OR link.validator_version IS NULL
-               OR link.validator_version NOT IN (%s, %s, %s)
+               OR link.validator_version NOT IN (%s, %s, %s, %s)
                OR link.validated_document_id IS DISTINCT FROM document.document_id
+               OR (
+                    link.validator_version IS DISTINCT FROM %s
+                    AND EXISTS (
+                        SELECT 1
+                        FROM policy_web_source AS sibling_link
+                        JOIN policy AS sibling_policy
+                          ON sibling_policy.policy_no = sibling_link.policy_no
+                         AND sibling_policy.is_active = TRUE
+                        WHERE sibling_link.source_id = link.source_id
+                          AND sibling_link.is_active = TRUE
+                          AND sibling_link.policy_no <> link.policy_no
+                          AND LOWER(BTRIM(sibling_policy.policy_name))
+                              = LOWER(BTRIM(policy_row.policy_name))
+                    )
+               )
             GROUP BY
                 source.source_id,
                 document.document_id,
@@ -381,6 +404,8 @@ def load_revalidation_candidates(
                 VALIDATOR_VERSION,
                 CURRENT_AI_VALIDATOR_VERSION,
                 STALE_AI_VALIDATOR_VERSION,
+                SAME_NAME_VERSION_GUARD_VERSION,
+                SAME_NAME_VERSION_GUARD_VERSION,
                 limit,
             ),
         )

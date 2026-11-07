@@ -76,6 +76,7 @@ class UnifiedRagSearchTests(unittest.TestCase):
         self.assertNotIn("FROM policy_web_chunk", cursor.sql)
         self.assertIn("p.is_active = TRUE", cursor.sql)
         self.assertIn("retrieval.embedding_model = %s", cursor.sql)
+        self.assertIn("retrieval.embedding_encoding_format = %s", cursor.sql)
         self.assertIn("retrieval.policy_no = ANY(%s)", cursor.sql)
         self.assertIn("retrieval.source_type = ANY(%s)", cursor.sql)
         self.assertIn("retrieval.chunk_type = ANY(%s)", cursor.sql)
@@ -84,8 +85,14 @@ class UnifiedRagSearchTests(unittest.TestCase):
         )
         self.assertNotIn("source_priority DESC", cursor.sql)
         self.assertEqual(
-            cursor.params[1:5],
-            ["test-model", ["P1"], ["CRAWLED_WEB"], ["WEB_TEXT"]],
+            cursor.params[1:6],
+            [
+                "test-model",
+                "float",
+                ["P1"],
+                ["CRAWLED_WEB"],
+                ["WEB_TEXT"],
+            ],
         )
         self.assertEqual(cursor.params[0], cursor.params[-2])
         self.assertEqual(cursor.params[-1], 5)

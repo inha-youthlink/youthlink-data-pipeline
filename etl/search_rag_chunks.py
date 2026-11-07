@@ -11,6 +11,7 @@ from psycopg.rows import dict_row
 try:
     from .embedding_utils import (
         DEFAULT_EMBEDDING_DIMENSIONS,
+        DEFAULT_EMBEDDING_ENCODING_FORMAT,
         DEFAULT_EMBEDDING_MODEL,
         create_embedding_client,
         request_embeddings,
@@ -19,6 +20,7 @@ try:
 except ImportError:  # Direct execution: python etl/search_rag_chunks.py
     from embedding_utils import (
         DEFAULT_EMBEDDING_DIMENSIONS,
+        DEFAULT_EMBEDDING_ENCODING_FORMAT,
         DEFAULT_EMBEDDING_MODEL,
         create_embedding_client,
         request_embeddings,
@@ -66,8 +68,9 @@ def search_rag_chunks(
         "p.is_active = TRUE",
         "retrieval.embedding IS NOT NULL",
         "retrieval.embedding_model = %s",
+        "retrieval.embedding_encoding_format = %s",
     ]
-    where_params: list[Any] = [model]
+    where_params: list[Any] = [model, DEFAULT_EMBEDDING_ENCODING_FORMAT]
     if policy_nos:
         conditions.append("retrieval.policy_no = ANY(%s)")
         where_params.append(list(policy_nos))

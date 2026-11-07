@@ -22,7 +22,10 @@ from etl.crawl_policy_sources import (
     store_not_modified,
     store_success,
 )
-from etl.source_relevance import PolicyEvidence
+from etl.source_relevance import (
+    SAME_NAME_VERSION_GUARD_VERSION,
+    PolicyEvidence,
+)
 from etl.sync_policy_sources import normalize_url
 
 
@@ -1099,6 +1102,44 @@ class ValidationPersistenceTests(unittest.TestCase):
         self.assertEqual(counts, {"REVIEW_REQUIRED": 1})
         self.assertEqual(params[0], "REVIEW_REQUIRED")
         self.assertEqual(params[6], "document-iframe")
+
+    def test_same_name_policy_versions_require_exact_policy_number(self) -> None:
+        conn = RecordingValidationConnection()
+        page = extract_page(
+            "<html><body><article><h1>국제기구 직업체험 프로그램</h1><p>"
+            + ("인천광역시 국제협력과 인턴 지원 안내입니다. " * 15)
+            + "</p></article></body></html>"
+        )
+        policies = (
+            PolicyEvidence(
+                policy_no="P-2025",
+                policy_name="국제기구 직업체험 프로그램",
+                organization_names=("인천광역시 국제협력과",),
+                distinctive_terms=("인턴",),
+            ),
+            PolicyEvidence(
+                policy_no="P-2026",
+                policy_name="국제기구 직업체험 프로그램",
+                organization_names=("인천광역시 국제협력과",),
+                distinctive_terms=("인턴",),
+            ),
+        )
+
+        counts = store_link_validations(
+            conn,
+            source_id="source-versioned",
+            document_id="document-versioned",
+            final_url="https://example.org/policy/334",
+            http_status=200,
+            extracted=page,
+            policies=policies,
+        )
+
+        self.assertEqual(counts, {"REVIEW_REQUIRED": 2})
+        self.assertEqual(len(conn.recording_cursor.executions), 2)
+        for _, params in conn.recording_cursor.executions:
+            self.assertEqual(params[0], "REVIEW_REQUIRED")
+            self.assertEqual(params[5], SAME_NAME_VERSION_GUARD_VERSION)
 
 
 if __name__ == "__main__":

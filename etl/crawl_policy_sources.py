@@ -24,9 +24,11 @@ from psycopg.types.json import Jsonb
 try:
     from .source_relevance import (
         REVIEW_REQUIRED,
+        SAME_NAME_VERSION_GUARD_VERSION,
         VERIFIED,
         PageEvidence,
         PolicyEvidence,
+        normalize_for_match,
         validate_policy_source,
     )
     from .sync_policy_sources import (
@@ -37,9 +39,11 @@ try:
 except ImportError:  # Direct execution: python etl/crawl_policy_sources.py
     from source_relevance import (
         REVIEW_REQUIRED,
+        SAME_NAME_VERSION_GUARD_VERSION,
         VERIFIED,
         PageEvidence,
         PolicyEvidence,
+        normalize_for_match,
         validate_policy_source,
     )
     from sync_policy_sources import NormalizedUrl, UrlNormalizationError, normalize_url
@@ -1107,9 +1111,24 @@ def store_link_validations(
     what prevents a later, changed page from inheriting an older VERIFIED
     result merely because its URL stayed the same.
     """
+    policy_rows = tuple(policies)
+    policies_by_name: dict[str, set[str]] = {}
+    for policy in policy_rows:
+        normalized_name = normalize_for_match(policy.policy_name)
+        if normalized_name:
+            policies_by_name.setdefault(normalized_name, set()).add(
+                policy.policy_no
+            )
+    ambiguous_policy_nos = {
+        policy_no
+        for policy_nos in policies_by_name.values()
+        if len(policy_nos) > 1
+        for policy_no in policy_nos
+    }
+
     validation_counts: dict[str, int] = {}
     with conn.cursor() as cur:
-        for policy in policies:
+        for policy in policy_rows:
             result = validate_policy_source(
                 policy,
                 PageEvidence(
@@ -1121,6 +1140,39 @@ def store_link_validations(
                     http_status=http_status,
                 ),
             )
+            if policy.policy_no in ambiguous_policy_nos:
+                strong_policy_number = bool(
+                    {
+                        "declared_policy_no_exact",
+                        "policy_no_url_exact",
+                    }
+                    & set(result.matched_signals)
+                )
+                if result.status == VERIFIED and not strong_policy_number:
+                    result = replace(
+                        result,
+                        status=REVIEW_REQUIRED,
+                        score=min(result.score, 0.79),
+                        conflicting_signals=tuple(
+                            dict.fromkeys(
+                                (
+                                    *result.conflicting_signals,
+                                    "same_name_policy_version_ambiguity",
+                                )
+                            )
+                        ),
+                        reason=(
+                            "Multiple active policies with the same name share "
+                            "this source, and the page does not identify the "
+                            "exact target policy number. Manual review is required."
+                        ),
+                        validator_version=SAME_NAME_VERSION_GUARD_VERSION,
+                    )
+                else:
+                    result = replace(
+                        result,
+                        validator_version=SAME_NAME_VERSION_GUARD_VERSION,
+                    )
             if (
                 extracted.retrieval.get("mode") == NAVER_IFRAME_MODE
                 and result.status == VERIFIED

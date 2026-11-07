@@ -1,6 +1,6 @@
 # 검증형 정책 원문 수집 파이프라인
 
-작성 기준: 2026-11-06
+작성 기준: 2026-11-07
 
 온통청년 API의 신청·참고 URL에서 부족한 정보를 보강하되, 관련 없는 페이지의 내용이 정책 데이터나 RAG에 들어가지 않도록 수집과 사용을 분리합니다. 이 파이프라인의 최우선 원칙은 **수집 성공이 곧 데이터 승인이라는 뜻이 아니며, `VERIFIED`를 통과한 데이터만 소비하는 것**입니다.
 
@@ -199,6 +199,8 @@ python etl/revalidate_policy_sources.py --limit 100 --write
 
 이 명령은 적용된 AI 관찰의 정책 근거 hash도 현재 정책명·기관·지역·신청기간·고유어로 다시 계산합니다. 정책 API나 지역 해석 변경으로 hash가 달라진 판정은 `REVIEW_REQUIRED`로 안전하게 되돌립니다. 현재 결정적 검증기와 AI 코드 검증기 버전이 모두 같고 근거도 변경되지 않은 판정만 보존하며, 이전 AI 코드 버전은 재검증 대상으로 돌립니다.
 
+같은 URL에 같은 정책명의 활성 정책이 둘 이상 연결된 경우는 연도별 정책 버전 오연결 위험이 있습니다. 이때 페이지 본문 또는 URL에 대상 `policy_no`가 정확히 존재하지 않으면 결정적 검증 결과가 높더라도 `same_name_policy_version_ambiguity` 충돌로 `REVIEW_REQUIRED`에 둡니다. AI도 정확한 대상 정책번호 직접 인용 없이는 `VERIFIED` 적용이 차단됩니다. 2026-11-07 재검증에서 이 보호 규칙이 기존 2025/2026 동일명 오승인 1건을 안전하게 내렸고, 재실행 대상은 0건입니다.
+
 같은 문서 버전에 끝난 수동 검토(`reviewed_at` 존재)는 자동 재검증으로 덮어쓰지 않습니다. 그러나 수집 본문의 hash가 바뀌어 새 `web_document`가 현재 버전이 되면 크롤러가 이전 판정·검수 메타데이터를 초기화합니다. 새 버전은 자동 판정과 필요한 수동 검토를 다시 통과해야 합니다.
 
 ### 4. `REVIEW_REQUIRED` AI 보조 검증
@@ -333,6 +335,7 @@ SELECT
 FROM rag_retrieval_chunk
 WHERE policy_no = ANY(:candidate_policy_nos)
   AND embedding_model = :embedding_model
+  AND embedding_encoding_format = 'float'
 ORDER BY embedding <=> :query_embedding::vector
 LIMIT :limit;
 ```
@@ -341,13 +344,13 @@ LIMIT :limit;
 
 ## 2026-11-07 로컬 검증 스냅샷
 
-- 정책 3,708건, 활성 3,664건, API `policy_chunk` 14,647건
-- `web_document` 전체 30건, 현재 문서 26건, 검증된 현재 원문 9건
-- `policy_web_chunk` 6건, 기존 binary Titan V2 1024차원 임베딩 6건
+- 정책 4,016건, 활성 3,973건, API `policy_chunk` 15,879건
+- `web_document` 전체 30건, 현재 문서 26건, 검증된 현재 원문 8건
+- `policy_web_chunk` 10건, float Titan V2 1024차원 임베딩 10건
 - AI 관찰 18건: `FAILED` 1건, `REVIEW_REQUIRED` 제안 12건, `VERIFIED` 제안 5건이며 그중 4건을 파일럿 적용
-- 소스 상태: `DISCOVERED` 2,933 / `FETCHED` 26 / `UNSUPPORTED` 6 / `BLOCKED` 5
-- 활성 관계 상태: `PENDING` 4,463 / `REVIEW_REQUIRED` 10 / `VERIFIED` 9 / `LINK_ONLY` 14 / `REJECTED` 1
+- 소스 상태: `DISCOVERED` 3,157 / `FETCHED` 26 / `UNSUPPORTED` 6 / `BLOCKED` 5
+- 활성 관계 상태: `PENDING` 4,938 / `REVIEW_REQUIRED` 11 / `VERIFIED` 8 / `LINK_ONLY` 21 / `REJECTED` 1
 
-이 스냅샷의 크롤링 결과와 임베딩은 별도 웹 계층에만 있으며 API `policy`와 `policy_chunk`를 수정하지 않았습니다. 기존 웹 청크에 아직 반영하지 않은 검증 원문 5건의 청크 생성과 float 임베딩은 전체 float 전환 작업까지 보류합니다. 남은 `REVIEW_REQUIRED` 10건은 종료·일몰 표시, 독립 근거 부족, API와 원문 기관값 충돌 또는 반복 판정 불안정 때문에 자동 적용하지 않습니다.
+이 스냅샷의 크롤링 결과와 임베딩은 별도 웹 계층에만 있으며 API `policy`와 `policy_chunk`를 수정하지 않았습니다. 현재 검증 원문의 청크 생성·float 임베딩·통합 projection 발행은 완료했습니다. 남은 `REVIEW_REQUIRED` 11건은 동일명 연도 버전 모호성, 종료·일몰 표시, 독립 근거 부족, API와 원문 기관값 충돌 또는 반복 판정 불안정 때문에 자동 적용하지 않습니다.
 
 2026-11-07 도메인 파일럿에서는 `youth.gwangju.go.kr` 3건이 모두 HTTP 200과 약 55KB HTML을 반환했지만 정책 본문이 없는 공용 경로 또는 JavaScript shell이어서 `INSUFFICIENT_TEXT`·`UNSUPPORTED`로 종료됐습니다. 같은 URL을 반복 요청하거나 도메인 전용 자동 승인을 추가하지 않았습니다. `youth.incheon.go.kr` 3건은 모두 상세 본문 수집에 성공했고 5개 정책 관계 중 결정적 근거가 충분한 1개만 `VERIFIED`, 나머지 4개는 `REVIEW_REQUIRED`가 됐습니다. 4개 모두 AI shadow에서도 독립 근거 부족, 미검증 모델 근거 또는 API·페이지 기관값 충돌로 보류됐습니다. 전체 현재 문서 재검증 계획은 `stale_ai=0`, `documents=0`이었습니다.

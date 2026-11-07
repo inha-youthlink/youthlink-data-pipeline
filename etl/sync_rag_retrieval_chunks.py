@@ -8,6 +8,11 @@ from typing import Any, Sequence
 import psycopg
 from dotenv import load_dotenv
 
+try:
+    from .embedding_utils import DEFAULT_EMBEDDING_ENCODING_FORMAT
+except ImportError:  # Direct execution
+    from embedding_utils import DEFAULT_EMBEDDING_ENCODING_FORMAT
+
 
 load_dotenv()
 
@@ -62,6 +67,7 @@ REQUIRED_COLUMNS = {
     "chunker_version",
     "embedding",
     "embedding_model",
+    "embedding_encoding_format",
     "token_count",
     "embedded_at",
     "source_updated_at",
@@ -88,6 +94,7 @@ COPY_COLUMNS = (
     "chunker_version",
     "embedding",
     "embedding_model",
+    "embedding_encoding_format",
     "token_count",
     "embedded_at",
     "source_updated_at",
@@ -122,7 +129,7 @@ def verify_schema(conn: psycopg.Connection[Any]) -> None:
     if missing:
         raise RuntimeError(
             "rag_retrieval_chunk schema is not ready; apply "
-            "db/migrations/016_add_rag_retrieval_chunks.sql first. "
+            "db/migrations through 018_track_float_embedding_format.sql first. "
             f"Missing columns: {', '.join(missing)}"
         )
 
@@ -180,6 +187,7 @@ def create_desired_snapshot(
             pc.chunker_version,
             {api_embedding} AS embedding,
             pc.embedding_model,
+            pc.embedding_encoding_format,
             pc.token_count,
             pc.embedded_at,
             pc.updated_at AS source_updated_at,
@@ -191,6 +199,7 @@ def create_desired_snapshot(
           AND pc.embedding IS NOT NULL
           AND pc.embedding_model IS NOT NULL
           AND BTRIM(pc.embedding_model) <> ''
+          AND pc.embedding_encoding_format = '{DEFAULT_EMBEDDING_ENCODING_FORMAT}'
           AND pc.embedding_error IS NULL
           {api_scope}
 
@@ -214,6 +223,7 @@ def create_desired_snapshot(
             verified.chunker_version,
             {web_embedding} AS embedding,
             verified.embedding_model,
+            verified.embedding_encoding_format,
             verified.token_count,
             verified.embedded_at,
             verified.updated_at AS source_updated_at,
@@ -224,6 +234,7 @@ def create_desired_snapshot(
         WHERE verified.embedding IS NOT NULL
           AND verified.embedding_model IS NOT NULL
           AND BTRIM(verified.embedding_model) <> ''
+          AND verified.embedding_encoding_format = '{DEFAULT_EMBEDDING_ENCODING_FORMAT}'
           AND web_chunk.embedding_error IS NULL
           {web_scope}
     """
@@ -261,11 +272,17 @@ def _load_source_counts(
                     WHERE pc.embedding IS NOT NULL
                       AND pc.embedding_model IS NOT NULL
                       AND BTRIM(pc.embedding_model) <> ''
+                      AND pc.embedding_encoding_format = '{DEFAULT_EMBEDDING_ENCODING_FORMAT}'
                       AND pc.embedding_error IS NULL
                 ),
                 COUNT(*) FILTER (
-                    WHERE pc.embedding IS NULL
-                      AND pc.embedding_error IS NULL
+                    WHERE pc.embedding_error IS NULL
+                      AND NOT (
+                          pc.embedding IS NOT NULL
+                          AND pc.embedding_model IS NOT NULL
+                          AND BTRIM(pc.embedding_model) <> ''
+                          AND pc.embedding_encoding_format = '{DEFAULT_EMBEDDING_ENCODING_FORMAT}'
+                      )
                 ),
                 COUNT(*) FILTER (WHERE pc.embedding_error IS NOT NULL)
             FROM policy_chunk AS pc
@@ -288,11 +305,17 @@ def _load_source_counts(
                     WHERE verified.embedding IS NOT NULL
                       AND verified.embedding_model IS NOT NULL
                       AND BTRIM(verified.embedding_model) <> ''
+                      AND verified.embedding_encoding_format = '{DEFAULT_EMBEDDING_ENCODING_FORMAT}'
                       AND web_chunk.embedding_error IS NULL
                 ),
                 COUNT(*) FILTER (
-                    WHERE verified.embedding IS NULL
-                      AND web_chunk.embedding_error IS NULL
+                    WHERE web_chunk.embedding_error IS NULL
+                      AND NOT (
+                          verified.embedding IS NOT NULL
+                          AND verified.embedding_model IS NOT NULL
+                          AND BTRIM(verified.embedding_model) <> ''
+                          AND verified.embedding_encoding_format = '{DEFAULT_EMBEDDING_ENCODING_FORMAT}'
+                      )
                 ),
                 COUNT(*) FILTER (
                     WHERE web_chunk.embedding_error IS NOT NULL

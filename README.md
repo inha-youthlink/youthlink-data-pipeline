@@ -4,7 +4,7 @@
 
 정책 ETL은 `policy`, `policy_application_period`, `policy_region`, `policy_eligibility_code` 4개 테이블을 적재합니다. 지역 ETL은 VWorld의 시도·시군구 정보를 `region`에 동기화하며, 지역 View를 통해 과거·상위 코드와 알려진 범위 누락을 현재 코드로 해석합니다. `common_code`는 SQL seed로 채웁니다. 정책 청크 생성, LiteLLM 게이트웨이 기반 Titan V2 임베딩 적재, pgvector cosine 검색 파이프라인이 구현되어 있습니다.
 
-> 작성 기준: 2026-11-06에 정리한 프로젝트 구현 상태. 아래의 구현 현황은 코드 기준이며, 실제 운영 DB 상태는 각 환경에서 검증해야 합니다.
+> 작성 기준: 2026-11-07에 정리한 프로젝트 구현 상태. 아래의 구현 현황은 코드 기준이며, 실제 운영 DB 상태는 각 환경에서 검증해야 합니다.
 
 ## 문서
 
@@ -37,7 +37,7 @@
 youthlink-data-pipeline/
 ├── db/
 │   ├── extensions.sql          # vector, pgcrypto 확장 활성화
-│   ├── schema.sql              # 기본 20개 테이블·웹 검증 View·인덱스
+│   ├── schema.sql              # 기본 23개 테이블·웹 검증 View·인덱스
 │   ├── migrations/             # 지역·청크·정책 수명주기·웹 원문·채팅 마이그레이션
 │   └── seed/
 │       ├── common_code.sql     # API 코드 → 이름 매핑
@@ -69,10 +69,13 @@ youthlink-data-pipeline/
 │   ├── embed_policy_web_chunks.py # 검증 원문 청크 전용 임베딩
 │   ├── sync_rag_retrieval_chunks.py # 두 원천을 단일 검색 projection에 발행
 │   ├── search_rag_chunks.py   # 통합 projection 단일 pgvector 검색
+│   ├── apply_migrations.py    # 중복 번호를 해소한 명시적 migration 순서·체크섬 이력
+│   ├── run_policy_pipeline.py # 정책 동기화→청크→임베딩→발행 통합 작업
+│   ├── check_pipeline_health.py # 운영 실패·미해결 지역·임베딩 상태 점검
 │   └── logs/                  # 실행 중 생성, Git 제외
 │       └── failed_policies.jsonl
 ├── tests/                       # 네트워크·DB 없이 실행되는 단위 테스트
-├── .github/workflows/tests.yml # Python 3.10~3.12 CI
+├── .github/workflows/tests.yml # Python 3.10~3.12 단위 테스트 + pgvector 스키마 CI
 ├── sample_response.json       # 로컬 적재 테스트용 응답
 ├── requirements.txt
 ├── .env.example               # 비밀값 없는 설정 템플릿
@@ -88,12 +91,15 @@ youthlink-data-pipeline/
 
 PostgreSQL에는 정책의 정형 조건과 API 원문(`JSONB`)을 함께 저장합니다. pgvector는 향후 정책 설명의 의미를 비교하는 벡터 검색에 사용합니다.
 
-README에 명시한 마이그레이션을 적용한 최종 구성은 **22개 프로젝트 테이블 + 6개 View**입니다. `db/schema.sql`이 웹 원문 staging·AI 검토 관찰·원천별 청크·통합 검색 projection·채팅 계층을 포함한 기본 20개 테이블과 검증 전용 View 3개를 만들고, 지역 마이그레이션이 `region`, `region_code_mapping`과 지역 View 3개를 추가합니다. 중간 단계의 `region_code_alias`는 004 마이그레이션이 데이터를 이관한 뒤 제거하므로 최종 테이블 수에 포함되지 않습니다. 로컬에 별도로 존재할 수 있는 pgvector 설치 확인용 `vector_test`는 프로젝트 테이블 수에 포함하지 않습니다.
+README에 명시한 마이그레이션을 적용한 최종 구성은 **25개 프로젝트 테이블 + 6개 View**입니다. `db/schema.sql`이 웹 원문 staging·AI 검토 관찰·원천별 청크·통합 검색 projection·채팅·운영 이력 계층을 포함한 기본 23개 테이블과 검증 전용 View 3개를 만들고, 지역 마이그레이션이 `region`, `region_code_mapping`과 지역 View 3개를 추가합니다. 중간 단계의 `region_code_alias`는 004 마이그레이션이 데이터를 이관한 뒤 제거하므로 최종 테이블 수에 포함되지 않습니다. 과거 pgvector 설치 확인용 `vector_test`는 2026-11-07 로컬 DB에서 제거했습니다.
 
 | 테이블 | 역할 | 현재 데이터 입력 방식 |
 | --- | --- | --- |
 | `common_code` | API 코드, 코드 그룹, 사람이 읽는 이름 | SQL seed |
 | `policy_sync_job` | 온통청년 전체 동기화의 시작·종료·성공·실패·비활성화 이력 | 정책 API ETL |
+| `schema_migration` | canonical migration 파일명·SHA-256·적용 시각 이력 | migration runner |
+| `policy_pipeline_job` | 통합 정책 pipeline의 상태·재개 지점·요약 | 통합 pipeline CLI |
+| `policy_pipeline_step` | 통합 작업의 단계별 성공·실패·출력 tail | 통합 pipeline CLI |
 | `policy` | 정책 번호·이름·지원 내용·나이·소득·기간·기관·URL·원문 | ETL UPSERT |
 | `policy_application_period` | 정책별 정확한 신청 기간. 복수 기간은 여러 행으로 저장 | ETL 재동기화 |
 | `policy_region` | 정책별 대상 지역 코드. `(policy_no, region_code)`가 기본키 | ETL 재동기화 |
@@ -121,7 +127,7 @@ API 원천 계층과 크롤링 계층은 서로 덮어쓰지 않습니다. `poli
 
 정책 하나에는 여러 지역·자격 조건·청크가 연결됩니다. 대화방에는 프로필 하나와 여러 메시지가 연결되며, 메시지와 정책은 `message_policy_ref`로 연결합니다. `common_code`는 코드 해석용 사전이며, 현재 정책의 코드 컬럼에 공통 코드 외래키를 강제하지는 않습니다.
 
-`policy_chunk.embedding`은 `VECTOR(1024)`이며 캡스톤 LiteLLM 게이트웨이의 `bedrock-titan-embed-v2`를 사용합니다. 코사인 거리용 HNSW 인덱스가 정의되어 있습니다. 아직 임베딩되지 않은 청크는 벡터·모델명·임베딩 시각이 모두 `NULL`입니다. 청크 생성기는 API를 호출하지 않고, 별도의 임베딩 CLI가 명시적인 `--write` 실행에서만 게이트웨이를 호출합니다.
+`policy_chunk.embedding`은 `VECTOR(1024)`이며 캡스톤 LiteLLM 게이트웨이의 `bedrock-titan-embed-v2`를 사용합니다. 코사인 거리용 HNSW 인덱스가 정의되어 있습니다. 아직 임베딩되지 않은 청크는 벡터·모델명·형식·임베딩 시각이 모두 `NULL`입니다. 완료 벡터는 `embedding_encoding_format = 'float'`가 강제되며 모델명이 같아도 형식이 다르거나 불명확하면 검색·발행되지 않습니다. 청크 생성기는 API를 호출하지 않고, 별도의 임베딩 CLI가 명시적인 `--write` 실행에서만 게이트웨이를 호출합니다.
 
 ### DB 준비
 
@@ -167,13 +173,23 @@ psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/m
 psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/015_converge_chat_schema.sql
 psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/016_add_rag_retrieval_chunks.sql
 psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/017_add_policy_web_ai_review.sql
+psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/018_track_float_embedding_format.sql
+psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/019_add_pipeline_operations.sql
 ```
 
-`region_code_mapping.canonical_code`는 `region.region_code`를 참조하므로 **VWorld 지역 적재를 매핑 seed보다 먼저** 실행해야 합니다. `004_retire_region_code_alias.sql`은 레거시 alias를 이관·제거하고, `006_add_policy_application_period.sql`은 정확한 복수 신청기간 테이블을 추가합니다. 기존 DB는 006 뒤 `backfill-periods`로 원문을 재파싱합니다. `007_complete_incheon_scope_and_add_scope_views.sql`은 인천 범위 누락 보정과 공용 지역 범위 View를, `008_add_policy_sync_tracking.sql`은 정책 동기화 작업과 소프트 비활성화를, `009_add_policy_web_sources.sql`은 검증형 웹 원문 staging 계층을 추가합니다. 010은 관련성 판정을 실제로 검사한 `web_document` 버전에 묶습니다. 011은 API 기반 `policy_chunk`와 완전히 분리된 크롤링 fallback 청크·벡터 계층을 추가하며, 012는 판정 문서가 동일 `web_source` 소속임을 복합 FK로 강제합니다. 013은 기존 1536차원 임베딩 파생값을 초기화하고 두 청크 테이블과 HNSW 인덱스를 Titan V2용 1024차원으로 전환합니다. 014는 대전광역시 상위 코드 `30000`을 현재 5개 구로 확장합니다. `015_converge_chat_schema.sql`은 새 DB, chat 마이그레이션 미적용 DB, 과거 chat 마이그레이션이 일부 또는 전부 적용된 DB를 최종 chat 구조로 수렴시킵니다. 016은 원천 테이블을 수정하지 않고 활성 API 청크와 현재 검증 웹 청크를 하나의 HNSW 인덱스로 발행하는 `rag_retrieval_chunk`를 추가합니다. 017은 `REVIEW_REQUIRED` 문서에 대한 AI 근거 추출 결과와 코드 재검증 결과를 문서·정책 버전에 고정해 감사 기록으로 저장합니다.
+`region_code_mapping.canonical_code`는 `region.region_code`를 참조하므로 **VWorld 지역 적재를 매핑 seed보다 먼저** 실행해야 합니다. `004_retire_region_code_alias.sql`은 레거시 alias를 이관·제거하고, `006_add_policy_application_period.sql`은 정확한 복수 신청기간 테이블을 추가합니다. 기존 DB는 006 뒤 `backfill-periods`로 원문을 재파싱합니다. `007_complete_incheon_scope_and_add_scope_views.sql`은 인천 범위 누락 보정과 공용 지역 범위 View를, `008_add_policy_sync_tracking.sql`은 정책 동기화 작업과 소프트 비활성화를, `009_add_policy_web_sources.sql`은 검증형 웹 원문 staging 계층을 추가합니다. 010은 관련성 판정을 실제로 검사한 `web_document` 버전에 묶습니다. 011은 API 기반 `policy_chunk`와 완전히 분리된 크롤링 fallback 청크·벡터 계층을 추가하며, 012는 판정 문서가 동일 `web_source` 소속임을 복합 FK로 강제합니다. 013은 기존 1536차원 임베딩 파생값을 초기화하고 두 청크 테이블과 HNSW 인덱스를 Titan V2용 1024차원으로 전환합니다. 014는 대전광역시 상위 코드 `30000`을 현재 5개 구로 확장합니다. `015_converge_chat_schema.sql`은 새 DB, chat 마이그레이션 미적용 DB, 과거 chat 마이그레이션이 일부 또는 전부 적용된 DB를 최종 chat 구조로 수렴시킵니다. 016은 원천 테이블을 수정하지 않고 활성 API 청크와 현재 검증 웹 청크를 하나의 HNSW 인덱스로 발행하는 `rag_retrieval_chunk`를 추가합니다. 017은 `REVIEW_REQUIRED` 문서에 대한 AI 근거 추출 결과와 코드 재검증 결과를 문서·정책 버전에 고정해 감사 기록으로 저장합니다. 018은 임베딩 응답 형식을 별도 컬럼으로 추적하고 형식 미상 벡터를 안전하게 초기화해 `float`만 검색하도록 강제합니다. 019는 migration 체크섬 이력과 통합 정책 pipeline 작업·단계 이력을 추가합니다.
 
 과거 공유 이력에는 `008_add_chat_state.sql`과 `008_add_policy_sync_tracking.sql`, `009_add_chat_idempotency_and_scrap.sql`과 `009_add_policy_web_sources.sql`처럼 번호가 중복된 파일이 남아 있습니다. 기존 파일은 rename하지 않으며, 새 환경과 기존 환경 모두 위에 명시한 **정확한 파일명 순서**를 사용하고 chat 구조는 015로 수렴시킵니다. 015가 기존 `user_id` 또는 정책 표시 순서를 안전하게 복원할 수 없는 데이터를 발견하면 임의 값을 넣지 않고 트랜잭션을 중단하므로, 실제 매핑을 먼저 정리한 뒤 다시 적용합니다.
 
-현재 별도의 마이그레이션 이력 도구는 없습니다. 적용한 파일과 순서를 환경별로 기록하세요. 기존 DB에서는 이미 적용한 마이그레이션을 무조건 반복 실행하지 말고 현재 스키마와 데이터를 먼저 확인합니다.
+019까지 적용한 기존 DB 또는 최신 `schema.sql`로 만든 새 DB는 검증 후 한 번만 baseline을 기록합니다. 이후에는 runner가 명시적 파일명 순서와 SHA-256을 검사하므로 중복된 008/009 번호에 영향받지 않으며, 이미 적용된 파일을 수정하면 중단합니다.
+
+```bash
+python etl/apply_migrations.py --baseline-through 019_add_pipeline_operations.sql
+python etl/apply_migrations.py --status
+
+# 이후 새 migration이 추가됐을 때만 pending 파일 적용
+python etl/apply_migrations.py
+```
 
 ### common_code seed
 
@@ -686,6 +702,25 @@ python etl/embed_policy_chunks.py --write
 python etl/embed_policy_chunks.py --write --retry-errors
 ```
 
+운영에서는 세 명령을 따로 실행하지 않고 통합 작업을 사용합니다. 기본 실행은 PostgreSQL advisory lock으로 중복 실행을 막고, 정책 전체 동기화 → 변경 청크 생성 → 변경·실패 임베딩 → 통합 projection 발행 → 불변식 검증을 순서대로 수행합니다. 작업과 각 단계의 성공·실패는 `policy_pipeline_job`, `policy_pipeline_step`에 남고 실패한 작업 UUID는 해당 단계부터 재개할 수 있습니다.
+
+```bash
+# 실행 순서만 확인
+python etl/run_policy_pipeline.py --plan --workers 3
+
+# 실제 운영 실행
+python etl/run_policy_pipeline.py --workers 3
+
+# 실패 단계부터 새 작업으로 재개
+python etl/run_policy_pipeline.py --resume-job-id 실패한_UUID --workers 3
+
+# 스케줄러·알림 시스템이 사용할 상태 점검(비정상이면 exit 1)
+python etl/check_pipeline_health.py
+python etl/check_pipeline_health.py --json
+```
+
+Windows 작업 스케줄러, cron, CI 등 배포 환경의 스케줄러는 `run_policy_pipeline.py`의 종료 코드와 `check_pipeline_health.py --json` 결과를 사용합니다. 비밀값은 명령 인자로 넘기지 않고 `.env` 또는 배포 환경의 secret store로 주입합니다.
+
 두 원천의 임베딩이 적재된 뒤 통합 검색 projection을 계획하고 발행합니다. 이 단계는 기존 벡터를 DB 내부에서 복사하므로 게이트웨이 비용이 들지 않습니다.
 
 ```bash
@@ -714,7 +749,7 @@ WHERE table_schema = 'public'
 ORDER BY table_name;
 ```
 
-현재 `schema.sql`만 적용한 새 DB라면 웹 staging·AI 검토 관찰·원천별 청크·통합 검색 projection·채팅 계층을 포함한 20개 프로젝트 테이블과 검증 View 3개가 보입니다. README에 명시한 migration과 지역 적재를 모두 완료한 최종 상태에서는 **22개 프로젝트 테이블 + 6개 View**가 보여야 하고, `region_code_alias`는 없어야 합니다. View는 `v_policy_region_resolved`, `v_policy_region_scope`, `v_policy_sido_scope`, `v_verified_policy_web_document`, `v_verified_policy_enrichment`, `v_verified_policy_web_chunk`를 확인합니다. `vector_test`가 존재하더라도 pgvector 설치 확인용 프로젝트 외 테이블이므로 이 수에 포함하지 않습니다.
+현재 `schema.sql`만 적용한 새 DB라면 웹 staging·AI 검토 관찰·원천별 청크·통합 검색 projection·채팅·운영 이력 계층을 포함한 23개 프로젝트 테이블과 검증 View 3개가 보입니다. README에 명시한 migration과 지역 적재를 모두 완료한 최종 상태에서는 **25개 프로젝트 테이블 + 6개 View**가 보여야 하고, `region_code_alias`와 과거 테스트용 `vector_test`는 없어야 합니다. View는 `v_policy_region_resolved`, `v_policy_region_scope`, `v_policy_sido_scope`, `v_verified_policy_web_document`, `v_verified_policy_enrichment`, `v_verified_policy_web_chunk`를 확인합니다.
 
 ### 공통 코드와 적재 건수
 
@@ -774,10 +809,11 @@ SELECT
 FROM policy_chunk pc
 JOIN policy p ON p.policy_no = pc.policy_no;
 
-SELECT embedding_model, vector_dims(embedding), COUNT(*)
+SELECT embedding_model, embedding_encoding_format,
+       vector_dims(embedding), COUNT(*)
 FROM policy_chunk
 WHERE embedding IS NOT NULL
-GROUP BY embedding_model, vector_dims(embedding);
+GROUP BY embedding_model, embedding_encoding_format, vector_dims(embedding);
 
 SELECT policy_no, policy_name, min_age, max_age,
        source_updated_at, synced_at
@@ -851,7 +887,7 @@ DB에 들어간 행만 검사하면 롤백된 실패 정책은 보이지 않습�
 
 ### 코드·설정으로 준비된 항목
 
-- PostgreSQL 확장 설정, 기본 20개 테이블 정의, 지역 구성을 포함한 최종 22개 프로젝트 테이블 + 6개 View
+- PostgreSQL 확장 설정, 기본 23개 테이블 정의, 지역 구성을 포함한 최종 25개 프로젝트 테이블 + 6개 View
 - VWorld 시도·시군구 동기화와 `region` 지역 마스터 관리
 - 과거·분할·상위 지역 코드의 1:N 매핑과 `v_policy_region_resolved` 제공
 - 복수 신청기간의 정확한 행 저장과 더미·역전 날짜 안전 처리
@@ -866,7 +902,7 @@ DB에 들어간 행만 검사하면 롤백된 실패 정책은 보이지 않습�
 - 비활성 정책을 제외하는 청크 생성·임베딩 후보·Vector Search
 - API 키가 포함된 요청 URL을 숨기는 오류 정제와 제한적 Retry/Backoff
 - 고정 총건수 상한 없이 페이지를 순회하는 수집
-- 정책 변환·CLI·API 응답과 VWorld 필터/중복 처리 단위 테스트 및 CI
+- 정책 변환·CLI·API 응답과 VWorld 필터/중복 처리 단위 테스트 및 pgvector 스키마 통합 CI
 - `policy-v1` 청크 전략, 변경 감지 스키마, 결정적 청크 생성·동기화 CLI
 - LiteLLM 게이트웨이 기반 Titan V2 1024차원 float 임베딩 요청·배치 적재·재시도·오류 기록 CLI
 - 질문 임베딩과 pgvector cosine 검색, 정책 번호·청크 유형 후보 필터
@@ -880,9 +916,9 @@ DB에 들어간 행만 검사하면 롤백된 실패 정책은 보이지 않습�
 - API·검증 웹 청크의 기존 벡터를 원자적으로 발행하는 `rag_retrieval_chunk`와 단일 HNSW 검색 CLI
 - 샘플 파일 처리 함수, 환경변수 템플릿, 의존성 목록 및 Git 제외 규칙
 
-로컬 DB에는 정책 3,708건이 보존되어 있으며 3,664건은 활성, 원천에서 사라진 44건은 비활성 상태입니다. API 기반 청크 14,647건 중 활성 정책 청크 14,471건은 `bedrock-titan-embed-v2` 1024차원 기존 binary 값으로 임베딩돼 있고, 비활성 정책 청크 176건은 비용을 쓰지 않고 본문만 보존합니다. 2026-11-07 크롤링 검증 기준 활성 정책-URL 관계는 `PENDING` 4,463행, `REVIEW_REQUIRED` 10행, `VERIFIED` 9행, `LINK_ONLY` 14행, `REJECTED` 1행입니다. 소스 상태는 `DISCOVERED` 2,933건, `FETCHED` 26건, `UNSUPPORTED` 6건, `BLOCKED` 5건이며 전체 문서 30건 중 현재 문서는 26건입니다. 웹 청크는 기존 검증 원문에서 만든 6건을 유지하고 있으며 아직 반영하지 않은 검증 원문 5건의 청크 생성은 float 전환 작업까지 보류합니다.
+로컬 DB에는 정책 4,016건이 보존되어 있으며 3,973건은 활성, 원천에서 사라진 43건은 비활성 상태입니다. 2026-11-07 통합 pipeline의 최신 전체 동기화는 API 3,973건을 모두 성공 처리하고 실패 0건, 소프트 비활성화 10건으로 끝났습니다. API 기반 청크 15,879건 중 활성 정책 청크 15,707건은 `bedrock-titan-embed-v2` 1024차원 float 값으로 임베딩돼 있고, 비활성 정책 청크 172건은 본문과 기존 이력만 보존합니다. 최신 URL 동기화·저장 문서 재검증 뒤 활성 정책-URL 관계는 `PENDING` 4,938행, `REVIEW_REQUIRED` 11행, `VERIFIED` 8행, `LINK_ONLY` 21행, `REJECTED` 1행입니다. 같은 URL에 동일 정책명의 연도별 정책이 연결된 두 사례는 페이지에 대상 정책번호가 직접 없으면 자동 승인하지 않는 보호 규칙으로 재검증했으며, 잘못 승인됐던 2025 국제기구 직업체험 관계를 `REVIEW_REQUIRED`로 내렸습니다. 소스 상태는 `DISCOVERED` 3,157건, `FETCHED` 26건, `UNSUPPORTED` 6건, `BLOCKED` 5건이며 전체 문서 30건 중 현재 문서는 26건입니다. 현재 검증 경계의 웹 청크는 10건이며 모두 float 임베딩이 완료됐습니다.
 
-2026-11-06 통합 검색 publish 검증에서는 활성 API 청크 14,471건과 현재 검증 웹 청크 6건, 총 14,477건이 `rag_retrieval_chunk`에 발행됐습니다. 원천 content hash·모델·임베딩 시각과 다른 행은 0건이었고, 재실행 계획은 `inserted=0`, `updated=0`, `deleted=0`, `unchanged=14,477`이었습니다. 다만 이 기존 14,477개 벡터의 값은 0/1 binary 출력으로 생성된 상태입니다. 코드는 이후 요청부터 `encoding_format="float"`를 명시하고 binary-only 응답을 거부하도록 변경했으며, 기존 벡터 전체 재생성과 projection 재발행은 아직 수행하지 않았습니다.
+2026-11-07 float 전환에서는 pre-float custom dump를 만든 뒤 기존 활성 API 청크 14,471건과 현재 검증 웹 청크를 전부 재생성했습니다. 이어 실제 통합 pipeline이 최신 API 변경분 1,911개를 추가 임베딩하고 projection을 갱신해 현재 `rag_retrieval_chunk`는 API 15,707건 + 웹 10건, 총 15,717건입니다. 세 벡터 테이블 모두 1024차원, `embedding_encoding_format='float'`, binary-only 잔존 0건이며 정책·웹 임베딩 계획은 0건입니다. 실제 인천 월세 검색과 특정 정책 범위의 API+CRAWLED_WEB 단일 검색도 통과했습니다. 최신 공유본은 Git 제외 경로 `backups/youthlink_post_float_20261107.dump`입니다.
 
 2026-10-30 Naver 6건 파일럿에서는 숫자 게시물 URL 4건만 iframe 본문 수집에 성공했고, 게시물 ID가 없는 블로그 루트 2건은 `UNSUPPORTED`로 유지했습니다. 새 본문 4건은 모두 자동 승인 없이 검토했으며 광양 드림카페 1건만 `VERIFIED`, 완주 관광성 청년몰 글과 2024년 익산 모집 글은 `LINK_ONLY`, 대학리그와 다른 내용의 부산 이스포츠 글은 `REJECTED`로 판정했습니다. 이 과정과 별도 웹 임베딩은 API `policy`와 `policy_chunk`를 수정하지 않습니다.
 
@@ -894,26 +930,26 @@ DB에 들어간 행만 검사하면 롤백된 실패 정책은 보이지 않습�
 
 1. **float 임베딩 전환 완료**
    - [x] 이후 게이트웨이 요청을 float 형식으로 고정하고 binary-only 응답 차단
-   - [ ] 백업·예산·유지보수 시간 확인
-   - [ ] 전환 완료 시점까지 임베딩 write·projection publish·벡터 검색 동결
-   - [ ] 활성 정책 청크 14,471건과 검증 웹 청크 6건 전체 재생성
-   - [ ] 통합 검색 projection 14,477건 재발행
-   - [ ] binary-only 잔존 0건, 검색 품질, HNSW 상태 검증
-   - [ ] 최신 post-float DB 공유 dump 생성
+   - [x] pre-float 백업 생성 후 형식 추적 migration 적용
+   - [x] 현재 활성 정책 청크 15,707건과 검증 웹 청크 10건 float 생성
+   - [x] 통합 검색 projection 15,717건 발행
+   - [x] binary-only 잔존 0건, 검색 품질, HNSW 상태 검증
+   - [x] 최신 post-float DB 공유 dump 생성
 2. **AI 보조 원문 판정기 운영 검증**
    - [x] 정상 정책과 종료 정책 표본의 shadow 판정·코드 재검증
    - [x] 적용 불가 제안의 안전한 거부와 CLI 오류 처리 검증
    - [x] 당시 미검토 `REVIEW_REQUIRED` 전체의 소량 shadow 판정
    - [x] 검증 통과 observation 4건의 명시적 파일럿 적용
    - [x] 근거 부족·종료·판정 불안정 6건 자동 적용 보류
-   - [ ] 보류된 `REVIEW_REQUIRED` 10건의 사람 검토 또는 추가 원문 확보
-   - [ ] 새 `VERIFIED` 원문의 웹 청크 생성·float 임베딩·통합 projection 발행
+   - [ ] 보류된 `REVIEW_REQUIRED` 11건의 사람 검토 또는 추가 원문 확보
+   - [x] 현재 `VERIFIED` 원문의 웹 청크 생성·float 임베딩·통합 projection 발행
 3. **정책 운영 작업 통합**
-   - [ ] 정책 전체 동기화 → 변경 청크 생성 → 변경분 임베딩 → 결과 검증을 하나의 작업으로 연결
-   - [ ] 동시 실행 lock, 단계별 이력, 실패 재개와 오류 요약 추가
+   - [x] 정책 전체 동기화 → 변경 청크 생성 → 변경분 임베딩 → 발행·검증을 하나의 작업으로 연결
+   - [x] 동시 실행 advisory lock, 단계별 이력, 실패 단계 재개와 오류 요약 추가
 4. **스케줄링과 모니터링**
-   - [ ] 정책 API·VWorld 지역 동기화 주기 실행
-   - [ ] 정책 동기화 실패, 신규 `UNRESOLVED`, 임베딩 실패, 429·예산 알림
+   - [ ] 배포 환경의 작업 스케줄러에 정책 pipeline·VWorld 지역 동기화 주기 등록
+   - [x] 정책 동기화 실패, 신규 `UNRESOLVED`, 임베딩 실패를 종료 코드·JSON으로 노출
+   - [ ] 운영 알림 채널에 상태 점검 종료 코드와 429·예산 오류 연결
 5. **크롤링 데이터 점진 확대**
    - [ ] 도메인별 소량 파일럿을 계속하고 범용 추출 실패 유형을 축적
    - [ ] JavaScript 렌더링이 필요한 사이트의 안전한 범용 수집 전략 검증
@@ -922,6 +958,7 @@ DB에 들어간 행만 검사하면 롤백된 실패 정책은 보이지 않습�
    - [ ] 검증 원문에서 API에 없는 값과 근거 문장만 `policy_enrichment_fact`로 추출
    - [ ] 검증 상태와 RAG 보조 사용 규칙 구현
 7. **RAG 팀 연동 검증**
-   - [ ] RDB 후보 필터 → `rag_retrieval_chunk` 단일 검색 → 정책별 그룹화 흐름 통합 테스트
-   - [ ] API·크롤링 출처 표시와 동일 `policy_no` 범위 보장 검증
+   - [x] RDB 후보 `policy_no` → `rag_retrieval_chunk` 단일 검색의 실제 DB 회귀 검증
+   - [x] API·크롤링 출처 표시와 동일 `policy_no` 범위 보장 검증
+   - [ ] 백엔드 RAG 서비스의 정책별 그룹화·context 길이 통합 테스트
 

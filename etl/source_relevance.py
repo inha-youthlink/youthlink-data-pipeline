@@ -8,6 +8,9 @@ from urllib.parse import unquote, urlsplit
 
 
 VALIDATOR_VERSION = "policy-source-v2"
+SAME_NAME_VERSION_GUARD_VERSION = (
+    f"{VALIDATOR_VERSION}+same-name-version-guard-v1"
+)
 
 VERIFIED = "VERIFIED"
 REVIEW_REQUIRED = "REVIEW_REQUIRED"
