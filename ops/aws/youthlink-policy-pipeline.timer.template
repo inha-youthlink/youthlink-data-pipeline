@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the YouthLink ETL pipeline every day
+Documentation=file://@REPO_DIR@/docs/aws-ec2-operations.md
+
+[Timer]
+OnCalendar=@ON_CALENDAR@
+Persistent=true
+AccuracySec=1min
+RandomizedDelaySec=0
+Unit=youthlink-policy-pipeline.service
+
+[Install]
+WantedBy=timers.target

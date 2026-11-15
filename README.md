@@ -79,7 +79,10 @@ youthlink-data-pipeline/
 │   ├── run_policy_pipeline.ps1 # 예약 실행·상태 점검·로컬 로그
 │   ├── register_policy_pipeline_task.ps1 # 정책 Windows 작업 스케줄러 등록
 │   ├── run_web_pipeline.ps1   # 웹 pipeline 예약 실행·상태 점검·로그
-│   └── register_web_pipeline_task.ps1 # 웹 Windows 작업 스케줄러 등록
+│   ├── register_web_pipeline_task.ps1 # 웹 Windows 작업 스케줄러 등록
+│   └── aws/                    # EC2 Linux systemd 서비스·timer 설치
+├── docs/
+│   └── aws-ec2-operations.md  # AWS 운영 배포·로그·장애 대응 절차
 ├── tests/                       # 네트워크·DB 없이 실행되는 단위 테스트
 ├── .github/workflows/tests.yml # Python 3.10~3.12 단위 테스트 + pgvector 스키마 CI
 ├── sample_response.json       # 로컬 적재 테스트용 응답
@@ -499,7 +502,7 @@ API 모드는 **페이지 단위 트랜잭션 안에 정책별 SAVEPOINT**를 �
 
 빈 응답, 일부 정책 실패, 총건수 변화, 중복 정책 번호, 네트워크 중단이 있으면 작업은 `PARTIAL` 또는 `FAILED`가 되고 비활성화는 수행하지 않습니다. 이후 API에 다시 나타난 정책은 자동으로 활성화됩니다.
 
-정책 API 동기화는 통합 pipeline을 통해 청크·임베딩·검색 projection까지 연결됩니다. Windows 개발·운영 PC에서는 `ops/register_policy_pipeline_task.ps1`로 예약 작업을 등록할 수 있고, 서버 환경에서는 같은 Python 진입점을 cron이나 CI에서 실행할 수 있습니다. PostgreSQL advisory lock이 동시 실행을 막으며 최근 실패는 실패 단계부터 재개됩니다.
+정책 API 동기화는 통합 pipeline을 통해 청크·임베딩·검색 projection까지 연결됩니다. Windows 개발 PC에서는 `ops/register_policy_pipeline_task.ps1`로 예약 작업을 등록할 수 있습니다. AWS EC2 Linux 운영 서버에서는 `ops/aws/install_systemd.sh`가 같은 Python 진입점을 systemd 서비스와 timer에 연결합니다. PostgreSQL advisory lock이 동시 실행을 막으며 최근 실패는 실패 단계부터 재개됩니다.
 
 API에서 사라진 정책과 기존 청크·임베딩은 이력 확인을 위해 보존합니다. 청크 생성, 임베딩 후보 선택, Vector Search는 기본적으로 `is_active = true` 정책만 사용합니다.
 
@@ -660,7 +663,9 @@ python etl/run_web_pipeline.py
 python etl/run_web_pipeline.py --resume-latest-failed
 ```
 
-Windows 정책·웹 작업은 모두 매일 04:30에 시작합니다. 웹 작업은 정책 pipeline의 최근 성공을 최대 30분 기다린 뒤 수집을 시작하므로 동시에 DB 변경을 진행하지 않습니다. PC가 꺼져 예약을 놓치면 다음 로그인·네트워크 연결 후 같은 순서로 실행합니다.
+AWS EC2 Linux가 운영 기준입니다. systemd timer가 매일 04:30 KST에 정책 pipeline을 시작하고, 정책 작업이 성공한 경우에만 웹 pipeline을 이어서 실행합니다. 예약 시각에 EC2가 중지돼 있었다면 다음 부팅 후 누락 실행을 보완하고, 각 서비스는 실패 시 15분 간격으로 최대 2회 재시도합니다. 설치와 운영 절차는 [AWS EC2 운영 자동화](docs/aws-ec2-operations.md)를 참고합니다.
+
+Windows 예약 작업은 로컬 개발·비상 점검용으로 유지합니다. 두 Windows 작업은 모두 매일 04:30에 시작하며, 웹 작업은 정책 pipeline의 최근 성공을 최대 30분 기다린 뒤 수집을 시작합니다. PC가 꺼져 예약을 놓치면 다음 로그인·네트워크 연결 후 같은 순서로 실행합니다.
 
 ```powershell
 # 변경 없이 등록 계획 확인
@@ -757,7 +762,7 @@ python etl/check_pipeline_health.py
 python etl/check_pipeline_health.py --json
 ```
 
-Windows에서는 아래 명령으로 기본 매일 04:30 예약 작업을 등록합니다. 등록 스크립트는 현재 로그인한 사용자로 실행하며 PC가 꺼져 있었으면 다음 사용 가능 시 시작하고, 실패하면 15분 간격으로 최대 2회 재시도합니다. 실제 실행은 최근 실패가 6시간 이내면 그 단계부터 재개합니다.
+Windows 로컬 환경에서는 아래 명령으로 기본 매일 04:30 예약 작업을 등록합니다. 등록 스크립트는 현재 로그인한 사용자로 실행하며 PC가 꺼져 있었으면 다음 사용 가능 시 시작하고, 실패하면 15분 간격으로 최대 2회 재시도합니다. 실제 실행은 최근 실패가 6시간 이내면 그 단계부터 재개합니다. AWS 운영 환경에서는 이 작업 대신 [EC2 systemd 설치 절차](docs/aws-ec2-operations.md)를 사용합니다.
 
 ```powershell
 # 등록 내용을 실제로 바꾸지 않고 확인
@@ -1009,6 +1014,8 @@ DB에 들어간 행만 검사하면 롤백된 실패 정책은 보이지 않습�
 4. **스케줄링과 모니터링**
    - [x] 정책 pipeline Windows 예약 실행·재시도·로그 스크립트 구현
    - [x] 현재 운영 PC에 정책 pipeline 매일 04:30 작업 등록
+   - [x] AWS EC2 Linux용 systemd 정책→웹 순차 실행·재시도·누락 실행 보완 구성
+   - [ ] 실제 배정받은 EC2에 저장소·비밀값·systemd 서비스 설치 후 1회 운영 검증
    - [ ] VWorld 지역 동기화 주기 추가
    - [x] 제한형 웹 pipeline·실패 재개·Windows 예약 실행 구현
    - [x] 현재 운영 PC에 웹 pipeline 매일 04:30 작업 등록
