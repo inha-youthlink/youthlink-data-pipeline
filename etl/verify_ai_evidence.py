@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover - direct script/import compatibility
     from source_relevance import PageEvidence, PolicyEvidence, normalize_for_match
 
 
-AI_REVIEWER_VERSION = "ai-evidence-code-v5"
+AI_REVIEWER_VERSION = "ai-evidence-code-v6"
 VERIFIED = "VERIFIED"
 REVIEW_REQUIRED = "REVIEW_REQUIRED"
 REJECTED = "REJECTED"
@@ -631,6 +631,15 @@ def verify_ai_evidence(
     conflicting_evidence_tuple = _deduplicate(conflicting_evidence)
     lifecycle_flags_tuple = _deduplicate(lifecycle_flags)
     rejected_evidence_tuple = _deduplicate(rejected_evidence)
+    # Unsupported optional support claims must never count toward approval,
+    # but they also need not veto an otherwise complete proof. Identity,
+    # conflict, lifecycle, and other-policy extraction failures remain
+    # blocking because they can change which policy the page describes.
+    blocking_rejected_evidence = tuple(
+        item
+        for item in rejected_evidence_tuple
+        if item.get("kind") != "SUPPORT"
+    )
 
     # A name copied into a listing/body is not by itself a single-policy
     # identity. Require the exact target name in a heading, or pair an exact
@@ -676,7 +685,7 @@ def verify_ai_evidence(
         and len(support_categories) >= 2
         and not blocking_conflict
         and not lifecycle_flags_tuple
-        and not rejected_evidence_tuple
+        and not blocking_rejected_evidence
     )
     if can_verify:
         return EvidenceVerification(
@@ -742,7 +751,7 @@ def verify_ai_evidence(
         blockers.append("conflicting_evidence")
     if lifecycle_flags_tuple:
         blockers.append("lifecycle_flag")
-    if rejected_evidence_tuple:
+    if blocking_rejected_evidence:
         blockers.append("unverified_model_evidence")
 
     return EvidenceVerification(

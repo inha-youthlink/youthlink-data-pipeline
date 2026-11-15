@@ -112,7 +112,27 @@ class VerifyAiEvidenceTests(unittest.TestCase):
 
         self.assertEqual(result.proposed_status, REVIEW_REQUIRED)
         self.assertIn("quote_not_found", {item["reason"] for item in result.rejected_evidence})
-        self.assertIn("unverified_model_evidence", result.blockers)
+        self.assertIn("fewer_than_two_independent_support_categories", result.blockers)
+        self.assertNotIn("unverified_model_evidence", result.blockers)
+
+    def test_extra_unverified_support_does_not_veto_complete_proof(self):
+        payload = self.payload()
+        payload["supporting_evidence"].append(
+            {
+                "category": "REGION",
+                "value": "인천광역시",
+                "quote": "페이지에 존재하지 않는 지역 인용",
+            }
+        )
+
+        result = self.verify(payload)
+
+        self.assertEqual(result.proposed_status, VERIFIED)
+        self.assertIn(
+            "quote_not_found",
+            {item["reason"] for item in result.rejected_evidence},
+        )
+        self.assertNotIn("unverified_model_evidence", result.blockers)
 
     def test_any_extra_unverified_model_evidence_blocks_approval(self):
         payload = self.payload()

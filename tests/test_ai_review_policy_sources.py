@@ -11,11 +11,14 @@ from etl.ai_review_policy_sources import (
     PROMPT_VERSION,
     AiReviewCandidate,
     apply_ai_observation,
+    apply_safe_link_only_observation,
     build_messages,
     enforce_same_name_version_safety,
+    is_safe_link_only_triage,
     load_ai_review_candidates,
     load_reprocessable_observation,
     load_safe_observation_ids,
+    load_safe_link_only_observation_ids,
     load_uncached_ai_review_candidates,
     main,
     parse_args,
@@ -182,7 +185,51 @@ class ArgumentAndPromptTests(unittest.TestCase):
         args = parse_args(["--apply-safe-observations", "--write", "--limit", "3"])
 
         self.assertTrue(args.apply_safe_observations)
+
+    def test_safe_link_only_triage_is_explicit(self) -> None:
+        args = parse_args(
+            [
+                "--apply-safe-link-only-observations",
+                "--write",
+                "--limit",
+                "3",
+            ]
+        )
+
+        self.assertTrue(args.apply_safe_link_only_observations)
         self.assertTrue(args.write)
+
+    def test_link_only_triage_requires_non_detail_without_exact_identity(self) -> None:
+        deterministic = Mock(status="REVIEW_REQUIRED", matched_signals=())
+        verification = Mock(
+            page_type="PORTAL",
+            proposed_status="REVIEW_REQUIRED",
+            verification_result="INSUFFICIENT",
+            identity_result="INSUFFICIENT",
+        )
+
+        self.assertTrue(
+            is_safe_link_only_triage(
+                deterministic=deterministic,
+                verification=verification,
+            )
+        )
+
+        verification.identity_result = "EXACT"
+        self.assertFalse(
+            is_safe_link_only_triage(
+                deterministic=deterministic,
+                verification=verification,
+            )
+        )
+        verification.identity_result = "INSUFFICIENT"
+        deterministic.matched_signals = ("policy_name_heading_exact",)
+        self.assertFalse(
+            is_safe_link_only_triage(
+                deterministic=deterministic,
+                verification=verification,
+            )
+        )
 
     def test_skip_cached_requires_shadow(self) -> None:
         with redirect_stderr(io.StringIO()):
@@ -409,6 +456,8 @@ class SelectionAndCacheTests(unittest.TestCase):
         self.assertIn("review.reviewer_version = %s", sql)
         self.assertIn("document.is_current = TRUE", sql)
         self.assertIn("link.validation_status = 'REVIEW_REQUIRED'", sql)
+        self.assertIn("jsonb_array_elements(latest.identity_evidence)", sql)
+        self.assertIn("sibling_policy.policy_name", sql)
         self.assertEqual(params[-1], 5)
 
     def test_success_insert_loses_cache_race_without_aborting(self) -> None:

@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS web_pipeline_job (
     CONSTRAINT chk_web_pipeline_step
         CHECK (current_step IN (
             'SOURCE_SYNC', 'CRAWL', 'REVALIDATE', 'AI_SHADOW',
-            'AI_APPLY', 'WEB_CHUNKS', 'WEB_EMBEDDINGS',
+            'AI_APPLY', 'AI_TRIAGE', 'WEB_CHUNKS', 'WEB_EMBEDDINGS',
             'RAG_PUBLISH', 'VERIFY', 'COMPLETED'
         )),
     CONSTRAINT chk_web_pipeline_limits
@@ -155,11 +155,11 @@ CREATE TABLE IF NOT EXISTS web_pipeline_step (
     CONSTRAINT chk_web_pipeline_step_name
         CHECK (step_name IN (
             'SOURCE_SYNC', 'CRAWL', 'REVALIDATE', 'AI_SHADOW',
-            'AI_APPLY', 'WEB_CHUNKS', 'WEB_EMBEDDINGS',
+            'AI_APPLY', 'AI_TRIAGE', 'WEB_CHUNKS', 'WEB_EMBEDDINGS',
             'RAG_PUBLISH', 'VERIFY'
         )),
     CONSTRAINT chk_web_pipeline_step_order
-        CHECK (step_order BETWEEN 1 AND 9),
+        CHECK (step_order BETWEEN 1 AND 10),
     CONSTRAINT chk_web_pipeline_step_status
         CHECK (status IN ('RUNNING', 'SUCCEEDED', 'FAILED')),
     CONSTRAINT chk_web_pipeline_step_finished

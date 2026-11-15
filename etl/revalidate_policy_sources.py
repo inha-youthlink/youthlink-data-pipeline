@@ -52,6 +52,7 @@ DB_DSN = os.getenv(
 )
 CURRENT_AI_VALIDATOR_VERSION = f"{VALIDATOR_VERSION}+{AI_REVIEWER_VERSION}"
 LEGACY_AI_VALIDATOR_VERSIONS = (
+    f"{VALIDATOR_VERSION}+ai-evidence-code-v5",
     f"{VALIDATOR_VERSION}+ai-evidence-code-v4",
     f"{VALIDATOR_VERSION}+ai-evidence-code-v3",
     f"{VALIDATOR_VERSION}+ai-evidence-code-v2",
@@ -60,6 +61,21 @@ COMPATIBLE_AI_VALIDATOR_VERSIONS = tuple(
     dict.fromkeys((CURRENT_AI_VALIDATOR_VERSION, *LEGACY_AI_VALIDATOR_VERSIONS))
 )
 STALE_AI_VALIDATOR_VERSION = f"{VALIDATOR_VERSION}+ai-evidence-stale-v1"
+LINK_ONLY_TRIAGE_VALIDATOR_VERSIONS = tuple(
+    f"{VALIDATOR_VERSION}+{reviewer}+link-only-triage-v1"
+    for reviewer in (AI_REVIEWER_VERSION, "ai-evidence-code-v5")
+)
+COMPATIBLE_RELATION_VALIDATOR_VERSIONS = tuple(
+    dict.fromkeys(
+        (
+            VALIDATOR_VERSION,
+            *COMPATIBLE_AI_VALIDATOR_VERSIONS,
+            STALE_AI_VALIDATOR_VERSION,
+            SAME_NAME_VERSION_GUARD_VERSION,
+            *LINK_ONLY_TRIAGE_VALIDATOR_VERSIONS,
+        )
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -429,9 +445,11 @@ def load_revalidation_candidates(
              AND policy_row.is_active = TRUE
             WHERE link.validation_status = 'PENDING'
                OR link.validator_version IS NULL
-               OR link.validator_version NOT IN (%s, %s, %s, %s, %s, %s, %s)
+               OR link.validator_version <> ALL(%s)
                OR link.validated_document_id IS DISTINCT FROM document.document_id
                OR (
+                    link.validation_status <> 'LINK_ONLY'
+                    AND
                     link.validator_version IS DISTINCT FROM %s
                     AND EXISTS (
                         SELECT 1
@@ -456,11 +474,7 @@ def load_revalidation_candidates(
             LIMIT %s
             """,
             (
-                VALIDATOR_VERSION,
-                CURRENT_AI_VALIDATOR_VERSION,
-                *LEGACY_AI_VALIDATOR_VERSIONS,
-                STALE_AI_VALIDATOR_VERSION,
-                SAME_NAME_VERSION_GUARD_VERSION,
+                list(COMPATIBLE_RELATION_VALIDATOR_VERSIONS),
                 SAME_NAME_VERSION_GUARD_VERSION,
                 limit,
             ),

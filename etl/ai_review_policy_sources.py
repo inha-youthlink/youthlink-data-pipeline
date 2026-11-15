@@ -18,7 +18,14 @@ from psycopg.types.json import Jsonb
 try:
     from .ai_evidence_schema import AI_EVIDENCE_JSON_SCHEMA, parse_ai_evidence
     from .embedding_utils import create_embedding_client
-    from .source_relevance import PageEvidence, PolicyEvidence, VALIDATOR_VERSION
+    from .source_relevance import (
+        LINK_ONLY,
+        REVIEW_REQUIRED,
+        PageEvidence,
+        PolicyEvidence,
+        VALIDATOR_VERSION,
+        validate_policy_source,
+    )
     from .verify_ai_evidence import (
         AI_REVIEWER_VERSION,
         legacy_policy_evidence_hash,
@@ -29,7 +36,14 @@ try:
 except ImportError:  # Direct execution: python etl/ai_review_policy_sources.py
     from ai_evidence_schema import AI_EVIDENCE_JSON_SCHEMA, parse_ai_evidence
     from embedding_utils import create_embedding_client
-    from source_relevance import PageEvidence, PolicyEvidence, VALIDATOR_VERSION
+    from source_relevance import (
+        LINK_ONLY,
+        REVIEW_REQUIRED,
+        PageEvidence,
+        PolicyEvidence,
+        VALIDATOR_VERSION,
+        validate_policy_source,
+    )
     from verify_ai_evidence import (
         AI_REVIEWER_VERSION,
         legacy_policy_evidence_hash,
@@ -50,6 +64,21 @@ AI_VALIDATOR_VERSION = f"{VALIDATOR_VERSION}+{AI_REVIEWER_VERSION}"
 DEFAULT_MAX_PAGE_CHARACTERS = 80_000
 MAX_INVALID_OUTPUT_CHARACTERS = 20_000
 APPLICABLE_STATUSES = ("VERIFIED", "REJECTED")
+LINK_ONLY_TRIAGE_PAGE_TYPES = ("PORTAL", "LISTING_MULTI", "ERROR_OR_EMPTY")
+LINK_ONLY_TRIAGE_VALIDATOR_VERSION = (
+    f"{AI_VALIDATOR_VERSION}+link-only-triage-v1"
+)
+STRONG_DETERMINISTIC_IDENTITY_SIGNALS = frozenset(
+    {
+        "declared_policy_no_exact",
+        "declared_policy_name_match",
+        "policy_no_exact",
+        "policy_no_url_exact",
+        "policy_no_heading_exact",
+        "policy_no_body_exact",
+        "policy_name_heading_exact",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -704,6 +733,8 @@ def load_safe_observation_ids(
                     review.source_id,
                     review.document_id,
                     review.content_hash,
+                    review.proposed_status,
+                    review.identity_evidence,
                     review.created_at
                 FROM policy_web_ai_review AS review
                 WHERE review.execution_status = 'SUCCEEDED'
@@ -732,10 +763,134 @@ def load_safe_observation_ids(
                   AND link.validation_status = 'REVIEW_REQUIRED'
                   AND link.reviewed_at IS NULL
             )
+              AND (
+                latest.proposed_status <> 'VERIFIED'
+                OR EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements(latest.identity_evidence) AS evidence
+                    WHERE evidence->>'kind' = 'POLICY_NUMBER'
+                      AND LOWER(evidence->>'value') = LOWER(latest.policy_no)
+                )
+                OR NOT EXISTS (
+                    SELECT 1
+                    FROM policy AS target_policy
+                    JOIN policy_web_source AS sibling_link
+                      ON sibling_link.source_id = latest.source_id
+                     AND sibling_link.policy_no <> latest.policy_no
+                     AND sibling_link.is_active = TRUE
+                    JOIN policy AS sibling_policy
+                      ON sibling_policy.policy_no = sibling_link.policy_no
+                     AND sibling_policy.is_active = TRUE
+                    WHERE target_policy.policy_no = latest.policy_no
+                      AND target_policy.is_active = TRUE
+                      AND LOWER(BTRIM(sibling_policy.policy_name))
+                          = LOWER(BTRIM(target_policy.policy_name))
+                )
+              )
             ORDER BY latest.created_at, latest.ai_review_id
             LIMIT %s
             """,
             (list(APPLICABLE_STATUSES), AI_REVIEWER_VERSION, limit),
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+def is_safe_link_only_triage(
+    *,
+    deterministic: Any,
+    verification: Any,
+) -> bool:
+    """Return whether a current observation is safe to demote to link metadata.
+
+    The model's page type is never sufficient by itself. The deterministic
+    validator must also find no exact target identity, and fresh code
+    verification must still classify the observation as insufficient.
+    """
+    if verification.page_type not in LINK_ONLY_TRIAGE_PAGE_TYPES:
+        return False
+    if verification.proposed_status != REVIEW_REQUIRED:
+        return False
+    if verification.verification_result != "INSUFFICIENT":
+        return False
+    if verification.identity_result == "EXACT":
+        return False
+    if deterministic.status not in {REVIEW_REQUIRED, LINK_ONLY}:
+        return False
+    return not (
+        set(deterministic.matched_signals)
+        & STRONG_DETERMINISTIC_IDENTITY_SIGNALS
+    )
+
+
+def load_safe_link_only_observation_ids(
+    conn: psycopg.Connection[Any],
+    *,
+    limit: int,
+) -> list[UUID]:
+    """Load current non-detail observations for guarded LINK_ONLY triage."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH latest AS (
+                SELECT DISTINCT ON (
+                    review.policy_no, review.source_id, review.document_id
+                )
+                    review.ai_review_id,
+                    review.policy_no,
+                    review.source_id,
+                    review.document_id,
+                    review.content_hash,
+                    review.created_at
+                FROM policy_web_ai_review AS review
+                WHERE review.execution_status = 'SUCCEEDED'
+                  AND review.proposed_status = 'REVIEW_REQUIRED'
+                  AND review.verification_result = 'INSUFFICIENT'
+                  AND review.page_type = ANY(%s)
+                  AND review.identity_result <> 'EXACT'
+                  AND review.prompt_version = %s
+                  AND review.reviewer_version = %s
+                ORDER BY
+                    review.policy_no,
+                    review.source_id,
+                    review.document_id,
+                    review.created_at DESC,
+                    review.ai_review_id DESC
+            )
+            SELECT latest.ai_review_id
+            FROM latest
+            WHERE EXISTS (
+                SELECT 1
+                FROM policy_web_source AS link
+                JOIN web_document AS document
+                  ON document.document_id = link.validated_document_id
+                 AND document.source_id = link.source_id
+                 AND document.is_current = TRUE
+                 AND document.content_hash = latest.content_hash
+                WHERE link.policy_no = latest.policy_no
+                  AND link.source_id = latest.source_id
+                  AND link.is_active = TRUE
+                  AND link.validation_status = 'REVIEW_REQUIRED'
+                  AND link.reviewed_at IS NULL
+            )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM policy_web_source AS strong_link
+                WHERE strong_link.policy_no = latest.policy_no
+                  AND strong_link.source_id = latest.source_id
+                  AND strong_link.is_active = TRUE
+                  AND strong_link.validation_status = 'REVIEW_REQUIRED'
+                  AND strong_link.matched_signals ?| %s
+              )
+            ORDER BY latest.created_at, latest.ai_review_id
+            LIMIT %s
+            """,
+            (
+                list(LINK_ONLY_TRIAGE_PAGE_TYPES),
+                PROMPT_VERSION,
+                AI_REVIEWER_VERSION,
+                list(STRONG_DETERMINISTIC_IDENTITY_SIGNALS),
+                limit,
+            ),
         )
         return [row[0] for row in cur.fetchall()]
 
@@ -793,6 +948,187 @@ def _load_locked_policy(
     if row is None:
         raise RuntimeError("The observation policy is missing or inactive")
     return PolicyEvidence.from_mapping(row)
+
+
+def apply_safe_link_only_observation(
+    conn: psycopg.Connection[Any],
+    *,
+    ai_review_id: Any,
+) -> int:
+    """Recheck and atomically retain a non-detail page as link metadata only."""
+    snapshot = load_observation(conn, ai_review_id=ai_review_id)
+    if snapshot is None:
+        raise RuntimeError("AI review observation does not exist")
+    if snapshot["execution_status"] != "SUCCEEDED":
+        raise RuntimeError("Only a successful AI observation can be triaged")
+    if snapshot["proposed_status"] != REVIEW_REQUIRED:
+        raise RuntimeError("Only an insufficient observation can be triaged")
+    if snapshot["verification_result"] != "INSUFFICIENT":
+        raise RuntimeError("The observation is not an insufficient review")
+    if snapshot["page_type"] not in LINK_ONLY_TRIAGE_PAGE_TYPES:
+        raise RuntimeError("The observation is not a safe non-detail page type")
+    if snapshot["identity_result"] == "EXACT":
+        raise RuntimeError("Exact target identity requires policy-specific review")
+
+    policy = _load_locked_policy(conn, policy_no=snapshot["policy_no"])
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT source_id, COALESCE(final_url, canonical_url) AS source_url,
+                   http_status
+            FROM web_source
+            WHERE source_id = %s
+            FOR UPDATE
+            """,
+            (snapshot["source_id"],),
+        )
+        source = cur.fetchone()
+        if source is None:
+            raise RuntimeError("The observation web source no longer exists")
+
+        cur.execute(
+            """
+            SELECT document_id, content_hash, COALESCE(title, '') AS title,
+                   extracted_text, metadata
+            FROM web_document
+            WHERE document_id = %s
+              AND source_id = %s
+              AND is_current = TRUE
+              AND content_hash = %s
+            FOR UPDATE
+            """,
+            (
+                snapshot["document_id"],
+                snapshot["source_id"],
+                snapshot["content_hash"],
+            ),
+        )
+        document = cur.fetchone()
+        if document is None:
+            raise RuntimeError("The observed document is stale or no longer current")
+
+        cur.execute(
+            """
+            SELECT relation_type, validation_status, validated_document_id,
+                   reviewed_at
+            FROM policy_web_source
+            WHERE policy_no = %s
+              AND source_id = %s
+              AND is_active = TRUE
+            ORDER BY relation_type
+            FOR UPDATE OF policy_web_source
+            """,
+            (snapshot["policy_no"], snapshot["source_id"]),
+        )
+        links = list(cur.fetchall())
+
+    if not links:
+        raise RuntimeError("The observed policy/source relationship is no longer active")
+    if any(link["validation_status"] != REVIEW_REQUIRED for link in links):
+        raise RuntimeError("The relationship is no longer REVIEW_REQUIRED")
+    if any(link["reviewed_at"] is not None for link in links):
+        raise RuntimeError("A person has already reviewed this relationship")
+    if any(
+        str(link["validated_document_id"]) != str(snapshot["document_id"])
+        for link in links
+    ):
+        raise RuntimeError("The relationship now points to a different document")
+
+    locked = load_observation(conn, ai_review_id=ai_review_id, for_update=True)
+    if locked is None:
+        raise RuntimeError("The observation disappeared while being locked")
+    critical_fields = (
+        "policy_no",
+        "source_id",
+        "document_id",
+        "content_hash",
+        "policy_evidence_hash",
+        "proposed_status",
+        "verification_result",
+        "page_type",
+        "identity_result",
+    )
+    if any(locked[field] != snapshot[field] for field in critical_fields):
+        raise RuntimeError("The observation changed while its target was locked")
+    if locked["reviewer_version"] != AI_REVIEWER_VERSION:
+        raise RuntimeError("The observation uses a different code reviewer version")
+    if locked["prompt_version"] != PROMPT_VERSION:
+        raise RuntimeError("The observation uses a different prompt version")
+    if policy_evidence_hash(policy) != locked["policy_evidence_hash"]:
+        raise RuntimeError("The policy evidence changed after the AI observation")
+
+    metadata = document["metadata"] if isinstance(document["metadata"], dict) else {}
+    page = PageEvidence.from_mapping(
+        {
+            "final_url": source["source_url"],
+            "title": document["title"],
+            "h1": metadata.get("h1", ""),
+            "headings": metadata.get("headings", ()),
+            "text": document["extracted_text"],
+            "http_status": source["http_status"],
+        }
+    )
+    evidence = parse_ai_evidence(locked["raw_response"])
+    verification = verify_ai_evidence(policy, page, evidence)
+    deterministic = validate_policy_source(policy, page)
+    if not is_safe_link_only_triage(
+        deterministic=deterministic,
+        verification=verification,
+    ):
+        raise RuntimeError(
+            "Fresh code checks found policy-specific identity or an unsafe page type"
+        )
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE policy_web_source
+            SET validation_status = 'LINK_ONLY',
+                validation_score = LEAST(COALESCE(validation_score, 0.2), 0.2),
+                matched_signals = matched_signals || %s,
+                validation_reason = %s,
+                validator_version = %s,
+                validated_at = NOW(),
+                validated_document_id = %s
+            WHERE policy_no = %s
+              AND source_id = %s
+              AND is_active = TRUE
+              AND validation_status = 'REVIEW_REQUIRED'
+              AND validated_document_id = %s
+              AND reviewed_at IS NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM web_document AS current_document
+                  WHERE current_document.document_id = %s
+                    AND current_document.source_id = policy_web_source.source_id
+                    AND current_document.content_hash = %s
+                    AND current_document.is_current = TRUE
+              )
+            RETURNING relation_type
+            """,
+            (
+                Jsonb(["ai_structure_link_only"]),
+                (
+                    "AI-extracted page structure was rechecked by code: "
+                    f"{verification.page_type} has no exact target identity; "
+                    "retain the URL as link metadata only."
+                ),
+                LINK_ONLY_TRIAGE_VALIDATOR_VERSION,
+                snapshot["document_id"],
+                snapshot["policy_no"],
+                snapshot["source_id"],
+                snapshot["document_id"],
+                snapshot["document_id"],
+                snapshot["content_hash"],
+            ),
+        )
+        updated_relation_types = {row[0] for row in cur.fetchall()}
+    expected_relation_types = {link["relation_type"] for link in links}
+    if updated_relation_types != expected_relation_types:
+        raise RuntimeError(
+            "The relationship changed during triage; no partial decision is allowed"
+        )
+    return len(updated_relation_types)
 
 
 def enforce_same_name_version_safety(
@@ -1128,6 +1464,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "running every code safety check again"
         ),
     )
+    action.add_argument(
+        "--apply-safe-link-only-observations",
+        action="store_true",
+        help=(
+            "move current portal/listing/empty observations to LINK_ONLY "
+            "after deterministic identity checks"
+        ),
+    )
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument(
         "--skip-cached",
@@ -1167,6 +1511,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         or args.apply_review_id
         or args.reprocess_stored
         or args.apply_safe_observations
+        or args.apply_safe_link_only_observations
     ):
         parser.error(
             "--write requires an explicit shadow, reprocess, or apply action"
@@ -1283,6 +1628,53 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
             print(
                 "safe observation apply complete: "
+                f"observations={applied_observations}, "
+                f"relationships={applied_relationships}, skipped={skipped}"
+            )
+            return 0
+
+        if args.apply_safe_link_only_observations:
+            review_ids = load_safe_link_only_observation_ids(
+                conn,
+                limit=args.scan_limit,
+            )
+            print(
+                "safe LINK_ONLY triage plan: "
+                f"candidates={len(review_ids)}, apply_limit={args.limit}"
+            )
+            for review_id in review_ids[: args.limit]:
+                print(f"ai_review_id={review_id}")
+            if not args.write:
+                print("dry-run only; add --write to apply these observations")
+                return 0
+            conn.commit()
+            applied_observations = 0
+            applied_relationships = 0
+            skipped = 0
+            for review_id in review_ids:
+                if applied_observations >= args.limit:
+                    break
+                try:
+                    with conn.transaction():
+                        updated = apply_safe_link_only_observation(
+                            conn,
+                            ai_review_id=review_id,
+                        )
+                    applied_observations += 1
+                    applied_relationships += updated
+                    print(
+                        "safe LINK_ONLY triage applied: "
+                        f"ai_review_id={review_id}, relationships={updated}"
+                    )
+                except RuntimeError as exc:
+                    conn.rollback()
+                    skipped += 1
+                    print(
+                        "safe LINK_ONLY triage skipped: "
+                        f"ai_review_id={review_id}, reason={exc}"
+                    )
+            print(
+                "safe LINK_ONLY triage complete: "
                 f"observations={applied_observations}, "
                 f"relationships={applied_relationships}, skipped={skipped}"
             )

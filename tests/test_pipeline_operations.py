@@ -140,7 +140,9 @@ class PipelineOperationsTests(unittest.TestCase):
         self.assertIn("009_add_policy_web_sources.sql", MIGRATIONS)
         self.assertNotIn("008_add_chat_state.sql", MIGRATIONS)
         self.assertNotIn("009_add_chat_idempotency_and_scrap.sql", MIGRATIONS)
-        self.assertEqual(MIGRATIONS[-2], "019_add_pipeline_operations.sql")
+        self.assertEqual(MIGRATIONS[-3], "019_add_pipeline_operations.sql")
+        self.assertEqual(MIGRATIONS[-2], "020_add_web_pipeline_operations.sql")
+        self.assertEqual(MIGRATIONS[-1], "021_add_web_pipeline_ai_triage.sql")
 
     def test_operations_tables_exist_in_migration_and_fresh_schema(self) -> None:
         migration = MIGRATION.read_text(encoding="utf-8")

@@ -182,16 +182,17 @@ psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/m
 psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/018_track_float_embedding_format.sql
 psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/019_add_pipeline_operations.sql
 psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/020_add_web_pipeline_operations.sql
+psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/021_add_web_pipeline_ai_triage.sql
 ```
 
-`region_code_mapping.canonical_code`는 `region.region_code`를 참조하므로 **VWorld 지역 적재를 매핑 seed보다 먼저** 실행해야 합니다. `004_retire_region_code_alias.sql`은 레거시 alias를 이관·제거하고, `006_add_policy_application_period.sql`은 정확한 복수 신청기간 테이블을 추가합니다. 기존 DB는 006 뒤 `backfill-periods`로 원문을 재파싱합니다. `007_complete_incheon_scope_and_add_scope_views.sql`은 인천 범위 누락 보정과 공용 지역 범위 View를, `008_add_policy_sync_tracking.sql`은 정책 동기화 작업과 소프트 비활성화를, `009_add_policy_web_sources.sql`은 검증형 웹 원문 staging 계층을 추가합니다. 010은 관련성 판정을 실제로 검사한 `web_document` 버전에 묶습니다. 011은 API 기반 `policy_chunk`와 완전히 분리된 크롤링 fallback 청크·벡터 계층을 추가하며, 012는 판정 문서가 동일 `web_source` 소속임을 복합 FK로 강제합니다. 013은 기존 1536차원 임베딩 파생값을 초기화하고 두 청크 테이블과 HNSW 인덱스를 Titan V2용 1024차원으로 전환합니다. 014는 대전광역시 상위 코드 `30000`을 현재 5개 구로 확장합니다. `015_converge_chat_schema.sql`은 새 DB, chat 마이그레이션 미적용 DB, 과거 chat 마이그레이션이 일부 또는 전부 적용된 DB를 최종 chat 구조로 수렴시킵니다. 016은 원천 테이블을 수정하지 않고 활성 API 청크와 현재 검증 웹 청크를 하나의 HNSW 인덱스로 발행하는 `rag_retrieval_chunk`를 추가합니다. 017은 `REVIEW_REQUIRED` 문서에 대한 AI 근거 추출 결과와 코드 재검증 결과를 문서·정책 버전에 고정해 감사 기록으로 저장합니다. 018은 임베딩 응답 형식을 별도 컬럼으로 추적하고 형식 미상 벡터를 안전하게 초기화해 `float`만 검색하도록 강제합니다. 019는 migration 체크섬 이력과 통합 정책 pipeline 작업·단계 이력을, 020은 제한형 웹 pipeline 작업·단계 이력을 추가합니다.
+`region_code_mapping.canonical_code`는 `region.region_code`를 참조하므로 **VWorld 지역 적재를 매핑 seed보다 먼저** 실행해야 합니다. `004_retire_region_code_alias.sql`은 레거시 alias를 이관·제거하고, `006_add_policy_application_period.sql`은 정확한 복수 신청기간 테이블을 추가합니다. 기존 DB는 006 뒤 `backfill-periods`로 원문을 재파싱합니다. `007_complete_incheon_scope_and_add_scope_views.sql`은 인천 범위 누락 보정과 공용 지역 범위 View를, `008_add_policy_sync_tracking.sql`은 정책 동기화 작업과 소프트 비활성화를, `009_add_policy_web_sources.sql`은 검증형 웹 원문 staging 계층을 추가합니다. 010은 관련성 판정을 실제로 검사한 `web_document` 버전에 묶습니다. 011은 API 기반 `policy_chunk`와 완전히 분리된 크롤링 fallback 청크·벡터 계층을 추가하며, 012는 판정 문서가 동일 `web_source` 소속임을 복합 FK로 강제합니다. 013은 기존 1536차원 임베딩 파생값을 초기화하고 두 청크 테이블과 HNSW 인덱스를 Titan V2용 1024차원으로 전환합니다. 014는 대전광역시 상위 코드 `30000`을 현재 5개 구로 확장합니다. `015_converge_chat_schema.sql`은 새 DB, chat 마이그레이션 미적용 DB, 과거 chat 마이그레이션이 일부 또는 전부 적용된 DB를 최종 chat 구조로 수렴시킵니다. 016은 원천 테이블을 수정하지 않고 활성 API 청크와 현재 검증 웹 청크를 하나의 HNSW 인덱스로 발행하는 `rag_retrieval_chunk`를 추가합니다. 017은 `REVIEW_REQUIRED` 문서에 대한 AI 근거 추출 결과와 코드 재검증 결과를 문서·정책 버전에 고정해 감사 기록으로 저장합니다. 018은 임베딩 응답 형식을 별도 컬럼으로 추적하고 형식 미상 벡터를 안전하게 초기화해 `float`만 검색하도록 강제합니다. 019는 migration 체크섬 이력과 통합 정책 pipeline 작업·단계 이력을, 020은 제한형 웹 pipeline 작업·단계 이력을 추가합니다. 021은 포털·목록·빈 페이지를 코드로 재확인해 `LINK_ONLY`로 정리하는 `AI_TRIAGE` 운영 단계를 추가합니다.
 
 과거 공유 이력에는 `008_add_chat_state.sql`과 `008_add_policy_sync_tracking.sql`, `009_add_chat_idempotency_and_scrap.sql`과 `009_add_policy_web_sources.sql`처럼 번호가 중복된 파일이 남아 있습니다. 기존 파일은 rename하지 않으며, 새 환경과 기존 환경 모두 위에 명시한 **정확한 파일명 순서**를 사용하고 chat 구조는 015로 수렴시킵니다. 015가 기존 `user_id` 또는 정책 표시 순서를 안전하게 복원할 수 없는 데이터를 발견하면 임의 값을 넣지 않고 트랜잭션을 중단하므로, 실제 매핑을 먼저 정리한 뒤 다시 적용합니다.
 
-020까지 적용한 기존 DB 또는 최신 `schema.sql`로 만든 새 DB는 검증 후 한 번만 baseline을 기록합니다. 이후에는 runner가 명시적 파일명 순서와 SHA-256을 검사하므로 중복된 008/009 번호에 영향받지 않으며, 이미 적용된 파일을 수정하면 중단합니다.
+021까지 적용한 기존 DB 또는 최신 `schema.sql`로 만든 새 DB는 검증 후 한 번만 baseline을 기록합니다. 이후에는 runner가 명시적 파일명 순서와 SHA-256을 검사하므로 중복된 008/009 번호에 영향받지 않으며, 이미 적용된 파일을 수정하면 중단합니다.
 
 ```bash
-python etl/apply_migrations.py --baseline-through 020_add_web_pipeline_operations.sql
+python etl/apply_migrations.py --baseline-through 021_add_web_pipeline_ai_triage.sql
 python etl/apply_migrations.py --status
 
 # 이후 새 migration이 추가됐을 때만 pending 파일 적용
@@ -578,7 +579,7 @@ python etl/ai_review_policy_sources.py --reprocess-stored --limit 200
 python etl/ai_review_policy_sources.py --reprocess-stored --limit 200 --write
 ```
 
-AI는 페이지 유형과 직접 인용 근거만 폐쇄형 JSON으로 추출합니다. 코드가 각 인용이 정확한 저장 문서에 실제로 존재하는지, 값이 API 소유 정책 근거와 일치하는지 다시 확인합니다. 정확한 정책 정체성, 서로 독립적인 근거 2종 이상, 충돌·종료 표시·다중 정책·검증 실패 근거 없음이 모두 충족되어야 `VERIFIED`를 제안합니다. 행정기관명은 같은 시·도와 최종 부서명이 일치하고, 양쪽에 시·군·구가 있으면 그 범위까지 같은 경우에만 중간 본부·국 생략을 허용합니다. 다른 지역·다른 구·다른 최종 부서는 계속 충돌입니다. API의 설명·지원내용·신청방법·추가자격 등은 정규화 후 12자 이상인 문장이 저장 원문의 한 줄에 직접 포함된 경우에만 코드 보조 근거로 추가하며, 정책명 자체나 같은 문장의 중복 필드는 독립 근거로 세지 않습니다. 본문이 기본 80,000자 한도를 넘으면 잘라서 판단하지 않고 실패 관찰을 남겨 `REVIEW_REQUIRED`를 유지합니다.
+AI는 페이지 유형과 직접 인용 근거만 폐쇄형 JSON으로 추출합니다. 코드가 각 인용이 정확한 저장 문서에 실제로 존재하는지, 값이 API 소유 정책 근거와 일치하는지 다시 확인합니다. 정확한 정책 정체성, 서로 독립적인 근거 2종 이상, 충돌·종료 표시·다중 정책 없음이 모두 충족되어야 `VERIFIED`를 제안합니다. 추가로 추출한 선택적 지원 근거가 검증에 실패하면 그 근거만 제외하며, 정책 정체성·충돌·다른 정책·종료 여부의 검증 실패는 전체 승인을 계속 차단합니다. 행정기관명은 같은 시·도와 최종 부서명이 일치하고, 양쪽에 시·군·구가 있으면 그 범위까지 같은 경우에만 중간 본부·국 생략을 허용합니다. 다른 지역·다른 구·다른 최종 부서는 계속 충돌입니다. API의 설명·지원내용·신청방법·추가자격 등은 정규화 후 12자 이상인 문장이 저장 원문의 한 줄에 직접 포함된 경우에만 코드 보조 근거로 추가하며, 정책명 자체나 같은 문장의 중복 필드는 독립 근거로 세지 않습니다. 본문이 기본 80,000자 한도를 넘으면 잘라서 판단하지 않고 실패 관찰을 남겨 `REVIEW_REQUIRED`를 유지합니다.
 
 `REVIEW_REQUIRED`의 코드 차단 사유는 관찰 `metadata.review_blockers`에 배열로 저장됩니다. `--reprocess-stored`는 이전 성공 관찰의 동일한 `raw_response`를 현재 코드로 다시 검증하므로 새 AI 비용 없이 규칙 개선 효과를 확인할 수 있습니다. 문서 hash·prompt와 모델 입력용 정책 근거가 같아야 하며, 새 관찰에는 코드 보조 근거까지 포함한 현재 정책 근거 hash를 다시 저장합니다.
 
@@ -587,6 +588,13 @@ shadow 결과는 `policy_web_ai_review`에만 기록되며 `policy_web_source`�
 ```bash
 python etl/ai_review_policy_sources.py --apply-review-id <AI_REVIEW_UUID>
 python etl/ai_review_policy_sources.py --apply-review-id <AI_REVIEW_UUID> --write
+```
+
+포털·목록·빈 페이지는 정책 사실 근거로 사용하지 않고 링크 메타데이터로만 보존할 수 있습니다. AI의 페이지 유형만으로 상태를 바꾸지 않으며, 현재 문서·정책 근거 hash·미검토 상태를 잠근 뒤 결정적 검증기가 정확한 정책명·정책번호가 없음을 다시 확인한 경우에만 `LINK_ONLY`로 이동합니다.
+
+```bash
+python etl/ai_review_policy_sources.py --apply-safe-link-only-observations --limit 500 --scan-limit 1000
+python etl/ai_review_policy_sources.py --apply-safe-link-only-observations --write --limit 500 --scan-limit 1000
 ```
 
 적용 시에도 정책 활성 상태, 현재 문서 ID·본문 hash, 정책 근거 hash, 미검토 `REVIEW_REQUIRED` 상태를 트랜잭션 안에서 다시 잠그고 검증하며 저장된 원문으로 코드를 재실행합니다. 조건 하나라도 달라졌거나 제안이 여전히 `REVIEW_REQUIRED`이면 적용하지 않습니다. `REJECTED` 제안은 대상 정책번호가 없고 다른 정책명이 제목·H1·개별 heading에 직접 인용된 경우로 제한합니다. AI 적용은 `reviewed_by`, `reviewed_at`을 채우지 않으므로 이 필드는 계속 사람 검수 전용입니다.

@@ -14,6 +14,7 @@
   → web_document(staging)
   → 정책-페이지 관련성 판정
   → REVIEW_REQUIRED는 선택적으로 AI 근거 추출·코드 재검증
+  → 포털·목록·빈 페이지는 코드 재검사 후 LINK_ONLY로 정리
   → VERIFIED만 검증 전용 View에 노출
 ```
 
@@ -218,7 +219,7 @@ python etl/ai_review_policy_sources.py --shadow --limit 1 --write
 python etl/ai_review_policy_sources.py --show-observations --limit 20
 ```
 
-`--shadow --write`의 쓰기는 `policy_web_ai_review` 관찰 저장만 뜻합니다. AI는 폐쇄형 JSON으로 페이지 유형·정책 정체성·기관·지역·신청기간·고유어의 직접 인용과 충돌·종료 표시를 추출할 뿐 최종 상태를 쓰지 않습니다. 코드는 모든 인용을 저장된 제목·H1·heading·본문에서 다시 찾고 API 정책값과 비교합니다. 정확한 단일 정책 정체성과 서로 독립적인 근거 2종 이상이 있고, 충돌·다중 정책·종료 표시·검증 실패 근거가 하나도 없어야 `VERIFIED`를 제안합니다. 입력 한도를 넘는 본문은 잘라 판단하지 않고 실패 관찰로 남깁니다.
+`--shadow --write`의 쓰기는 `policy_web_ai_review` 관찰 저장만 뜻합니다. AI는 폐쇄형 JSON으로 페이지 유형·정책 정체성·기관·지역·신청기간·고유어의 직접 인용과 충돌·종료 표시를 추출할 뿐 최종 상태를 쓰지 않습니다. 코드는 모든 인용을 저장된 제목·H1·heading·본문에서 다시 찾고 API 정책값과 비교합니다. 정확한 단일 정책 정체성과 서로 독립적인 근거 2종 이상이 있고, 충돌·다중 정책·종료 표시가 없어야 `VERIFIED`를 제안합니다. 검증되지 않은 선택적 지원 근거는 증거에서 제외하지만, 정책 정체성·충돌·다른 정책·종료 여부의 검증 실패는 전체 승인을 차단합니다. 입력 한도를 넘는 본문은 잘라 판단하지 않고 실패 관찰로 남깁니다.
 
 관찰 적용은 UUID 하나를 명시해야 합니다. 먼저 dry-run으로 저장 제안을 확인한 뒤 `--write`를 붙입니다.
 
@@ -228,6 +229,13 @@ python etl/ai_review_policy_sources.py --apply-review-id <AI_REVIEW_UUID> --writ
 ```
 
 적용 트랜잭션은 활성 정책, 현재 문서 ID와 `content_hash`, 정책 근거 hash, 미검토 `REVIEW_REQUIRED` 관계를 잠그고 저장된 JSON을 현재 코드로 다시 검증합니다. stale 관찰, 이미 적용한 관찰, 근거가 부족한 제안, 사람 검토가 끝난 관계는 거부합니다. `REJECTED` 제안은 대상 정책번호가 없고 다른 정책명이 제목·H1·개별 heading에서 직접 확인된 경우로 제한합니다. AI 적용은 사람 검수 필드인 `reviewed_by`, `reviewed_at`을 채우지 않습니다.
+
+포털·목록·빈 페이지는 다음 명령으로 `LINK_ONLY` 후보를 계획하고 적용합니다. AI 페이지 유형만으로 판정하지 않으며 현재 문서와 정책 근거 hash를 잠근 뒤, 결정적 검증기가 정확한 정책명·정책번호가 없음을 다시 확인해야 적용됩니다. 원문과 정책-URL 관계는 삭제하지 않고 링크 메타데이터로 보존하며 사람 검수 필드는 채우지 않습니다.
+
+```bash
+python etl/ai_review_policy_sources.py --apply-safe-link-only-observations --limit 500 --scan-limit 1000
+python etl/ai_review_policy_sources.py --apply-safe-link-only-observations --write --limit 500 --scan-limit 1000
+```
 
 ### 5. `REVIEW_REQUIRED` 수동 검토
 

@@ -44,6 +44,7 @@ MIGRATIONS = (
     "018_track_float_embedding_format.sql",
     "019_add_pipeline_operations.sql",
     "020_add_web_pipeline_operations.sql",
+    "021_add_web_pipeline_ai_triage.sql",
 )
 
 

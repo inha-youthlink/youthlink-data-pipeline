@@ -6,8 +6,10 @@ from contextlib import redirect_stderr
 
 from etl.revalidate_policy_sources import (
     COMPATIBLE_AI_VALIDATOR_VERSIONS,
+    COMPATIBLE_RELATION_VALIDATOR_VERSIONS,
     CURRENT_AI_VALIDATOR_VERSION,
     LEGACY_AI_VALIDATOR_VERSIONS,
+    LINK_ONLY_TRIAGE_VALIDATOR_VERSIONS,
     RevalidationCandidate,
     STALE_AI_VALIDATOR_VERSION,
     StaleAiReviewTarget,
@@ -89,9 +91,10 @@ class RevalidationSelectionTests(unittest.TestCase):
         self.assertIn("link.validation_status = 'PENDING'", sql)
         self.assertIn("link.validator_version IS NULL", sql)
         self.assertIn(
-            "link.validator_version NOT IN (%s, %s, %s, %s, %s, %s, %s)",
+            "link.validator_version <> ALL(%s)",
             sql,
         )
+        self.assertIn("link.validation_status <> 'LINK_ONLY'", sql)
         self.assertIn("sibling_policy.policy_name", sql)
         self.assertIn(
             "link.validated_document_id IS DISTINCT FROM document.document_id",
@@ -101,11 +104,7 @@ class RevalidationSelectionTests(unittest.TestCase):
         self.assertEqual(
             params,
             (
-                VALIDATOR_VERSION,
-                CURRENT_AI_VALIDATOR_VERSION,
-                *LEGACY_AI_VALIDATOR_VERSIONS,
-                STALE_AI_VALIDATOR_VERSION,
-                SAME_NAME_VERSION_GUARD_VERSION,
+                list(COMPATIBLE_RELATION_VALIDATOR_VERSIONS),
                 SAME_NAME_VERSION_GUARD_VERSION,
                 25,
             ),
@@ -114,10 +113,16 @@ class RevalidationSelectionTests(unittest.TestCase):
     def test_current_base_ai_versions_are_not_selected_as_stale(self) -> None:
         self.assertEqual(
             CURRENT_AI_VALIDATOR_VERSION,
-            f"{VALIDATOR_VERSION}+ai-evidence-code-v5",
+            f"{VALIDATOR_VERSION}+ai-evidence-code-v6",
         )
         for version in LEGACY_AI_VALIDATOR_VERSIONS:
             self.assertIn(version, COMPATIBLE_AI_VALIDATOR_VERSIONS)
+        self.assertIn(
+            f"{VALIDATOR_VERSION}+ai-evidence-code-v5+link-only-triage-v1",
+            LINK_ONLY_TRIAGE_VALIDATOR_VERSIONS,
+        )
+        for version in LINK_ONLY_TRIAGE_VALIDATOR_VERSIONS:
+            self.assertIn(version, COMPATIBLE_RELATION_VALIDATOR_VERSIONS)
 
     def test_applied_ai_drift_is_filtered_by_current_policy_hash(self) -> None:
         policy = PolicyEvidence(

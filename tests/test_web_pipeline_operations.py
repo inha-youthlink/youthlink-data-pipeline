@@ -20,6 +20,9 @@ from etl.run_web_pipeline import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = REPO_ROOT / "db" / "migrations" / "020_add_web_pipeline_operations.sql"
+TRIAGE_MIGRATION = (
+    REPO_ROOT / "db" / "migrations" / "021_add_web_pipeline_ai_triage.sql"
+)
 SCHEMA = REPO_ROOT / "db" / "schema.sql"
 
 
@@ -33,6 +36,7 @@ class WebPipelineOperationsTests(unittest.TestCase):
                 "REVALIDATE",
                 "AI_SHADOW",
                 "AI_APPLY",
+                "AI_TRIAGE",
                 "WEB_CHUNKS",
                 "WEB_EMBEDDINGS",
                 "RAG_PUBLISH",
@@ -49,6 +53,10 @@ class WebPipelineOperationsTests(unittest.TestCase):
         self.assertIn("--per-host-limit", commands["CRAWL"])
         self.assertIn("--skip-cached", commands["AI_SHADOW"])
         self.assertIn("--apply-safe-observations", commands["AI_APPLY"])
+        self.assertIn(
+            "--apply-safe-link-only-observations",
+            commands["AI_TRIAGE"],
+        )
         self.assertIn("--retry-errors", commands["WEB_EMBEDDINGS"])
         self.assertIsNone(commands["VERIFY"])
 
@@ -144,7 +152,7 @@ class WebPipelineOperationsTests(unittest.TestCase):
         )
 
     def test_schema_and_migration_include_web_pipeline_history(self) -> None:
-        self.assertEqual(MIGRATIONS[-1], "020_add_web_pipeline_operations.sql")
+        self.assertEqual(MIGRATIONS[-1], "021_add_web_pipeline_ai_triage.sql")
         for sql in (
             MIGRATION.read_text(encoding="utf-8"),
             SCHEMA.read_text(encoding="utf-8"),
@@ -153,6 +161,9 @@ class WebPipelineOperationsTests(unittest.TestCase):
             self.assertIn("web_pipeline_step", sql)
             self.assertIn("AI_SHADOW", sql)
             self.assertIn("WEB_EMBEDDINGS", sql)
+        triage_sql = TRIAGE_MIGRATION.read_text(encoding="utf-8")
+        self.assertIn("AI_TRIAGE", triage_sql)
+        self.assertIn("BETWEEN 1 AND 10", triage_sql)
 
 
 if __name__ == "__main__":
