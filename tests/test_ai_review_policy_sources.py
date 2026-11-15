@@ -15,6 +15,8 @@ from etl.ai_review_policy_sources import (
     enforce_same_name_version_safety,
     load_ai_review_candidates,
     load_reprocessable_observation,
+    load_safe_observation_ids,
+    load_uncached_ai_review_candidates,
     main,
     parse_args,
     policy_evidence_hash,
@@ -157,6 +159,7 @@ class ArgumentAndPromptTests(unittest.TestCase):
         self.assertFalse(args.write)
         self.assertFalse(args.shadow)
         self.assertIsNone(args.apply_review_id)
+        self.assertFalse(args.apply_safe_observations)
 
     def test_write_requires_explicit_shadow_or_apply(self) -> None:
         with redirect_stderr(io.StringIO()):
@@ -174,6 +177,17 @@ class ArgumentAndPromptTests(unittest.TestCase):
 
         self.assertTrue(args.reprocess_stored)
         self.assertTrue(args.write)
+
+    def test_safe_bulk_apply_is_explicit(self) -> None:
+        args = parse_args(["--apply-safe-observations", "--write", "--limit", "3"])
+
+        self.assertTrue(args.apply_safe_observations)
+        self.assertTrue(args.write)
+
+    def test_skip_cached_requires_shadow(self) -> None:
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_args(["--skip-cached"])
 
     def test_host_filter_is_normalized(self) -> None:
         args = parse_args(["--host", "WWW.WONJU.GO.KR."])
@@ -309,6 +323,27 @@ class ArgumentAndPromptTests(unittest.TestCase):
         self.assertNotIn("Traceback", stderr.getvalue())
         self.assertEqual(conn.events, ["rollback"])
 
+    def test_safe_bulk_apply_continues_after_safety_rejection(self) -> None:
+        conn = MainConnection()
+        first = uuid4()
+        second = uuid4()
+        with patch(
+            "etl.ai_review_policy_sources.psycopg.connect",
+            return_value=conn,
+        ), patch(
+            "etl.ai_review_policy_sources.load_safe_observation_ids",
+            return_value=[first, second],
+        ), patch(
+            "etl.ai_review_policy_sources.apply_ai_observation",
+            side_effect=[2, RuntimeError("same name ambiguity")],
+        ):
+            with redirect_stdout(io.StringIO()) as output:
+                result = main(["--apply-safe-observations", "--write"])
+
+        self.assertEqual(result, 0)
+        self.assertIn("observations=1", output.getvalue())
+        self.assertIn("skipped=1", output.getvalue())
+
 
 class SelectionAndCacheTests(unittest.TestCase):
     def test_selection_is_current_active_unreviewed_review_required_only(self):
@@ -339,6 +374,42 @@ class SelectionAndCacheTests(unittest.TestCase):
         sql, params = conn.recording_cursor.executions[0]
         self.assertIn("source.host = %s", sql)
         self.assertEqual(params, ("www.wonju.go.kr", 5))
+
+    def test_uncached_selection_spends_limit_only_on_new_evidence(self) -> None:
+        cached = candidate()
+        fresh = candidate()
+        with patch(
+            "etl.ai_review_policy_sources.load_ai_review_candidates",
+            return_value=[cached, fresh],
+        ), patch(
+            "etl.ai_review_policy_sources.load_cached_observation",
+            side_effect=[{"ai_review_id": uuid4()}, None],
+        ):
+            selected, skipped = load_uncached_ai_review_candidates(
+                Mock(),
+                limit=1,
+                scan_limit=20,
+                model="chat-model",
+            )
+
+        self.assertEqual(selected, [fresh])
+        self.assertEqual(skipped, 1)
+
+    def test_safe_apply_selection_uses_current_unreviewed_documents(self) -> None:
+        review_id = uuid4()
+        conn = RecordingConnection([[(review_id,)]])
+
+        self.assertEqual(
+            load_safe_observation_ids(conn, limit=5),
+            [review_id],
+        )
+
+        sql, params = conn.recording_cursor.executions[0]
+        self.assertIn("review.execution_status = 'SUCCEEDED'", sql)
+        self.assertIn("review.reviewer_version = %s", sql)
+        self.assertIn("document.is_current = TRUE", sql)
+        self.assertIn("link.validation_status = 'REVIEW_REQUIRED'", sql)
+        self.assertEqual(params[-1], 5)
 
     def test_success_insert_loses_cache_race_without_aborting(self) -> None:
         item = candidate()

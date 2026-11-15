@@ -43,6 +43,7 @@ MIGRATIONS = (
     "017_add_policy_web_ai_review.sql",
     "018_track_float_embedding_format.sql",
     "019_add_pipeline_operations.sql",
+    "020_add_web_pipeline_operations.sql",
 )
 
 

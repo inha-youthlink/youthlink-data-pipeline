@@ -332,6 +332,34 @@ def load_cached_observation(
         return cur.fetchone()
 
 
+def load_uncached_ai_review_candidates(
+    conn: psycopg.Connection[Any],
+    *,
+    limit: int,
+    scan_limit: int,
+    model: str,
+    policy_no: str | None = None,
+    host: str | None = None,
+) -> tuple[list[AiReviewCandidate], int]:
+    """Select new current observations without repeatedly spending the limit."""
+    scanned = load_ai_review_candidates(
+        conn,
+        limit=scan_limit,
+        policy_no=policy_no,
+        host=host,
+    )
+    selected: list[AiReviewCandidate] = []
+    cached_count = 0
+    for candidate in scanned:
+        if load_cached_observation(conn, candidate=candidate, model=model) is not None:
+            cached_count += 1
+            continue
+        selected.append(candidate)
+        if len(selected) >= limit:
+            break
+    return selected, cached_count
+
+
 def store_observation(
     conn: psycopg.Connection[Any],
     *,
@@ -656,6 +684,60 @@ def load_observation(
             (ai_review_id,),
         )
         return cur.fetchone()
+
+
+def load_safe_observation_ids(
+    conn: psycopg.Connection[Any],
+    *,
+    limit: int,
+) -> list[UUID]:
+    """Load latest unapplied code-verified decisions for current review rows."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH latest AS (
+                SELECT DISTINCT ON (
+                    review.policy_no, review.source_id, review.document_id
+                )
+                    review.ai_review_id,
+                    review.policy_no,
+                    review.source_id,
+                    review.document_id,
+                    review.content_hash,
+                    review.created_at
+                FROM policy_web_ai_review AS review
+                WHERE review.execution_status = 'SUCCEEDED'
+                  AND review.proposed_status = ANY(%s)
+                  AND review.reviewer_version = %s
+                  AND review.applied_at IS NULL
+                ORDER BY
+                    review.policy_no,
+                    review.source_id,
+                    review.document_id,
+                    review.created_at DESC
+            )
+            SELECT latest.ai_review_id
+            FROM latest
+            WHERE EXISTS (
+                SELECT 1
+                FROM policy_web_source AS link
+                JOIN web_document AS document
+                  ON document.document_id = link.validated_document_id
+                 AND document.source_id = link.source_id
+                 AND document.is_current = TRUE
+                 AND document.content_hash = latest.content_hash
+                WHERE link.policy_no = latest.policy_no
+                  AND link.source_id = latest.source_id
+                  AND link.is_active = TRUE
+                  AND link.validation_status = 'REVIEW_REQUIRED'
+                  AND link.reviewed_at IS NULL
+            )
+            ORDER BY latest.created_at, latest.ai_review_id
+            LIMIT %s
+            """,
+            (list(APPLICABLE_STATUSES), AI_REVIEWER_VERSION, limit),
+        )
+        return [row[0] for row in cur.fetchall()]
 
 
 def _load_locked_policy(
@@ -1038,7 +1120,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "never calls the gateway"
         ),
     )
+    action.add_argument(
+        "--apply-safe-observations",
+        action="store_true",
+        help=(
+            "apply latest current VERIFIED/REJECTED observations after "
+            "running every code safety check again"
+        ),
+    )
     parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument(
+        "--skip-cached",
+        action="store_true",
+        help="with --shadow, spend the limit only on uncached current evidence",
+    )
+    parser.add_argument(
+        "--scan-limit",
+        type=int,
+        default=1000,
+        help="maximum REVIEW_REQUIRED rows scanned by --skip-cached",
+    )
     parser.add_argument("--policy-no")
     parser.add_argument("--host", help="restrict candidates to one exact host")
     parser.add_argument("--model")
@@ -1062,11 +1163,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if args.max_page_chars <= 0:
         parser.error("--max-page-chars must be greater than zero")
     if args.write and not (
-        args.shadow or args.apply_review_id or args.reprocess_stored
+        args.shadow
+        or args.apply_review_id
+        or args.reprocess_stored
+        or args.apply_safe_observations
     ):
         parser.error(
-            "--write requires --shadow, --reprocess-stored, or --apply-review-id"
+            "--write requires an explicit shadow, reprocess, or apply action"
         )
+    if args.scan_limit <= 0:
+        parser.error("--scan-limit must be greater than zero")
+    if args.scan_limit < args.limit:
+        parser.error("--scan-limit must be greater than or equal to --limit")
+    if args.skip_cached and not args.shadow:
+        parser.error("--skip-cached requires --shadow")
     if args.policy_no is not None:
         args.policy_no = args.policy_no.strip()
         if not args.policy_no or len(args.policy_no) > 30:
@@ -1131,12 +1241,80 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"AI observation apply rejected: {exc}", file=sys.stderr)
                 return 2
 
-        candidates = load_ai_review_candidates(
-            conn,
-            limit=args.limit,
-            policy_no=args.policy_no,
-            host=args.host,
-        )
+        if args.apply_safe_observations:
+            review_ids = load_safe_observation_ids(
+                conn,
+                limit=args.scan_limit,
+            )
+            print(
+                "safe observation apply plan: "
+                f"candidates={len(review_ids)}, apply_limit={args.limit}"
+            )
+            for review_id in review_ids[: args.limit]:
+                print(f"ai_review_id={review_id}")
+            if not args.write:
+                print("dry-run only; add --write to apply these observations")
+                return 0
+            conn.commit()
+            applied_observations = 0
+            applied_relationships = 0
+            skipped = 0
+            for review_id in review_ids:
+                if applied_observations >= args.limit:
+                    break
+                try:
+                    with conn.transaction():
+                        updated = apply_ai_observation(
+                            conn,
+                            ai_review_id=review_id,
+                        )
+                    applied_observations += 1
+                    applied_relationships += updated
+                    print(
+                        f"safe observation applied: ai_review_id={review_id}, "
+                        f"relationships={updated}"
+                    )
+                except RuntimeError as exc:
+                    conn.rollback()
+                    skipped += 1
+                    print(
+                        f"safe observation skipped: ai_review_id={review_id}, "
+                        f"reason={exc}"
+                    )
+            print(
+                "safe observation apply complete: "
+                f"observations={applied_observations}, "
+                f"relationships={applied_relationships}, skipped={skipped}"
+            )
+            return 0
+
+        selected_model = (
+            args.model or os.getenv("LITELLM_CHAT_MODEL", "")
+        ).strip()
+        if args.skip_cached:
+            if not selected_model:
+                raise RuntimeError(
+                    "LITELLM_CHAT_MODEL is required with --skip-cached"
+                )
+            candidates, cached_count = load_uncached_ai_review_candidates(
+                conn,
+                limit=args.limit,
+                scan_limit=args.scan_limit,
+                model=selected_model,
+                policy_no=args.policy_no,
+                host=args.host,
+            )
+            print(
+                f"uncached selection: candidates={len(candidates)}, "
+                f"cached_skipped={cached_count}, scan_limit={args.scan_limit}"
+            )
+        else:
+            candidates = load_ai_review_candidates(
+                conn,
+                limit=args.limit,
+                policy_no=args.policy_no,
+                host=args.host,
+            )
         print_candidates(
             candidates,
             snippet_chars=args.snippet_chars,
@@ -1196,7 +1374,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         api_key = os.getenv("LITELLM_API_KEY", "").strip()
         base_url = os.getenv("LITELLM_BASE_URL", "").strip()
-        model = (args.model or os.getenv("LITELLM_CHAT_MODEL", "")).strip()
+        model = selected_model
         if not api_key:
             raise RuntimeError("LITELLM_API_KEY is not set")
         if not base_url:

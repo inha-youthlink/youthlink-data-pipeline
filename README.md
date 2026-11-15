@@ -71,12 +71,15 @@ youthlink-data-pipeline/
 │   ├── search_rag_chunks.py   # 통합 projection 단일 pgvector 검색
 │   ├── apply_migrations.py    # 중복 번호를 해소한 명시적 migration 순서·체크섬 이력
 │   ├── run_policy_pipeline.py # 정책 동기화→청크→임베딩→발행 통합 작업
+│   ├── run_web_pipeline.py    # URL 동기화→제한 수집→AI 검증→웹 발행 통합 작업
 │   ├── check_pipeline_health.py # 운영 실패·미해결 지역·임베딩 상태 점검
 │   └── logs/                  # 실행 중 생성, Git 제외
 │       └── failed_policies.jsonl
 ├── ops/
 │   ├── run_policy_pipeline.ps1 # 예약 실행·상태 점검·로컬 로그
-│   └── register_policy_pipeline_task.ps1 # Windows 작업 스케줄러 등록
+│   ├── register_policy_pipeline_task.ps1 # 정책 Windows 작업 스케줄러 등록
+│   ├── run_web_pipeline.ps1   # 웹 pipeline 예약 실행·상태 점검·로그
+│   └── register_web_pipeline_task.ps1 # 웹 Windows 작업 스케줄러 등록
 ├── tests/                       # 네트워크·DB 없이 실행되는 단위 테스트
 ├── .github/workflows/tests.yml # Python 3.10~3.12 단위 테스트 + pgvector 스키마 CI
 ├── sample_response.json       # 로컬 적재 테스트용 응답
@@ -178,16 +181,17 @@ psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/m
 psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/017_add_policy_web_ai_review.sql
 psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/018_track_float_embedding_format.sql
 psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/019_add_pipeline_operations.sql
+psql -h localhost -p 5432 -U postgres -W -d youthlink -v ON_ERROR_STOP=1 -f db/migrations/020_add_web_pipeline_operations.sql
 ```
 
-`region_code_mapping.canonical_code`는 `region.region_code`를 참조하므로 **VWorld 지역 적재를 매핑 seed보다 먼저** 실행해야 합니다. `004_retire_region_code_alias.sql`은 레거시 alias를 이관·제거하고, `006_add_policy_application_period.sql`은 정확한 복수 신청기간 테이블을 추가합니다. 기존 DB는 006 뒤 `backfill-periods`로 원문을 재파싱합니다. `007_complete_incheon_scope_and_add_scope_views.sql`은 인천 범위 누락 보정과 공용 지역 범위 View를, `008_add_policy_sync_tracking.sql`은 정책 동기화 작업과 소프트 비활성화를, `009_add_policy_web_sources.sql`은 검증형 웹 원문 staging 계층을 추가합니다. 010은 관련성 판정을 실제로 검사한 `web_document` 버전에 묶습니다. 011은 API 기반 `policy_chunk`와 완전히 분리된 크롤링 fallback 청크·벡터 계층을 추가하며, 012는 판정 문서가 동일 `web_source` 소속임을 복합 FK로 강제합니다. 013은 기존 1536차원 임베딩 파생값을 초기화하고 두 청크 테이블과 HNSW 인덱스를 Titan V2용 1024차원으로 전환합니다. 014는 대전광역시 상위 코드 `30000`을 현재 5개 구로 확장합니다. `015_converge_chat_schema.sql`은 새 DB, chat 마이그레이션 미적용 DB, 과거 chat 마이그레이션이 일부 또는 전부 적용된 DB를 최종 chat 구조로 수렴시킵니다. 016은 원천 테이블을 수정하지 않고 활성 API 청크와 현재 검증 웹 청크를 하나의 HNSW 인덱스로 발행하는 `rag_retrieval_chunk`를 추가합니다. 017은 `REVIEW_REQUIRED` 문서에 대한 AI 근거 추출 결과와 코드 재검증 결과를 문서·정책 버전에 고정해 감사 기록으로 저장합니다. 018은 임베딩 응답 형식을 별도 컬럼으로 추적하고 형식 미상 벡터를 안전하게 초기화해 `float`만 검색하도록 강제합니다. 019는 migration 체크섬 이력과 통합 정책 pipeline 작업·단계 이력을 추가합니다.
+`region_code_mapping.canonical_code`는 `region.region_code`를 참조하므로 **VWorld 지역 적재를 매핑 seed보다 먼저** 실행해야 합니다. `004_retire_region_code_alias.sql`은 레거시 alias를 이관·제거하고, `006_add_policy_application_period.sql`은 정확한 복수 신청기간 테이블을 추가합니다. 기존 DB는 006 뒤 `backfill-periods`로 원문을 재파싱합니다. `007_complete_incheon_scope_and_add_scope_views.sql`은 인천 범위 누락 보정과 공용 지역 범위 View를, `008_add_policy_sync_tracking.sql`은 정책 동기화 작업과 소프트 비활성화를, `009_add_policy_web_sources.sql`은 검증형 웹 원문 staging 계층을 추가합니다. 010은 관련성 판정을 실제로 검사한 `web_document` 버전에 묶습니다. 011은 API 기반 `policy_chunk`와 완전히 분리된 크롤링 fallback 청크·벡터 계층을 추가하며, 012는 판정 문서가 동일 `web_source` 소속임을 복합 FK로 강제합니다. 013은 기존 1536차원 임베딩 파생값을 초기화하고 두 청크 테이블과 HNSW 인덱스를 Titan V2용 1024차원으로 전환합니다. 014는 대전광역시 상위 코드 `30000`을 현재 5개 구로 확장합니다. `015_converge_chat_schema.sql`은 새 DB, chat 마이그레이션 미적용 DB, 과거 chat 마이그레이션이 일부 또는 전부 적용된 DB를 최종 chat 구조로 수렴시킵니다. 016은 원천 테이블을 수정하지 않고 활성 API 청크와 현재 검증 웹 청크를 하나의 HNSW 인덱스로 발행하는 `rag_retrieval_chunk`를 추가합니다. 017은 `REVIEW_REQUIRED` 문서에 대한 AI 근거 추출 결과와 코드 재검증 결과를 문서·정책 버전에 고정해 감사 기록으로 저장합니다. 018은 임베딩 응답 형식을 별도 컬럼으로 추적하고 형식 미상 벡터를 안전하게 초기화해 `float`만 검색하도록 강제합니다. 019는 migration 체크섬 이력과 통합 정책 pipeline 작업·단계 이력을, 020은 제한형 웹 pipeline 작업·단계 이력을 추가합니다.
 
 과거 공유 이력에는 `008_add_chat_state.sql`과 `008_add_policy_sync_tracking.sql`, `009_add_chat_idempotency_and_scrap.sql`과 `009_add_policy_web_sources.sql`처럼 번호가 중복된 파일이 남아 있습니다. 기존 파일은 rename하지 않으며, 새 환경과 기존 환경 모두 위에 명시한 **정확한 파일명 순서**를 사용하고 chat 구조는 015로 수렴시킵니다. 015가 기존 `user_id` 또는 정책 표시 순서를 안전하게 복원할 수 없는 데이터를 발견하면 임의 값을 넣지 않고 트랜잭션을 중단하므로, 실제 매핑을 먼저 정리한 뒤 다시 적용합니다.
 
-019까지 적용한 기존 DB 또는 최신 `schema.sql`로 만든 새 DB는 검증 후 한 번만 baseline을 기록합니다. 이후에는 runner가 명시적 파일명 순서와 SHA-256을 검사하므로 중복된 008/009 번호에 영향받지 않으며, 이미 적용된 파일을 수정하면 중단합니다.
+020까지 적용한 기존 DB 또는 최신 `schema.sql`로 만든 새 DB는 검증 후 한 번만 baseline을 기록합니다. 이후에는 runner가 명시적 파일명 순서와 SHA-256을 검사하므로 중복된 008/009 번호에 영향받지 않으며, 이미 적용된 파일을 수정하면 중단합니다.
 
 ```bash
-python etl/apply_migrations.py --baseline-through 019_add_pipeline_operations.sql
+python etl/apply_migrations.py --baseline-through 020_add_web_pipeline_operations.sql
 python etl/apply_migrations.py --status
 
 # 이후 새 migration이 추가됐을 때만 pending 파일 적용
@@ -643,6 +647,33 @@ python etl/sync_rag_retrieval_chunks.py
 python etl/sync_rag_retrieval_chunks.py --write
 ```
 
+운영에서는 위 웹 단계를 따로 실행하지 않고 제한형 통합 작업을 사용합니다. 기본값은 한 번에 URL 50개, 정확한 host별 최대 2개, 새로운 AI 관찰 최대 20개입니다. 기존 성공 관찰은 AI 한도에서 제외하며, 새 AI 결과도 저장 원문·정책 근거를 코드로 다시 검증한 뒤 현재 문서와 상태가 그대로인 경우에만 자동 적용합니다. `REVIEW_REQUIRED` 제안이나 같은 이름의 연도별 정책처럼 모호한 결과는 그대로 보류합니다.
+
+```bash
+# 네트워크·AI 호출 없는 실행 계획
+python etl/run_web_pipeline.py --plan
+
+# 실제 1회 실행
+python etl/run_web_pipeline.py
+
+# 최근 실패 단계부터 재개
+python etl/run_web_pipeline.py --resume-latest-failed
+```
+
+Windows 정책·웹 작업은 모두 매일 04:30에 시작합니다. 웹 작업은 정책 pipeline의 최근 성공을 최대 30분 기다린 뒤 수집을 시작하므로 동시에 DB 변경을 진행하지 않습니다. PC가 꺼져 예약을 놓치면 다음 로그인·네트워크 연결 후 같은 순서로 실행합니다.
+
+```powershell
+# 변경 없이 등록 계획 확인
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File ops/register_web_pipeline_task.ps1 -WhatIf
+
+# 매일 04:30 등록 또는 갱신
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File ops/register_web_pipeline_task.ps1
+```
+
+실행 이력은 `web_pipeline_job`, `web_pipeline_step`에 남고 로그는 Git에서 제외된 `etl/logs/web-pipeline/`에 30일 보관됩니다. 크롤러는 기본 자동 실행에서 `DISCOVERED`만 처리하며 `BLOCKED`, `UNSUPPORTED`, `FAILED`를 무리하게 반복 요청하지 않습니다.
+
 RAG의 권장 순서는 다음과 같습니다.
 
 1. 사용자 프로필과 `policy` 조건으로 후보 `policy_no`를 만듭니다.
@@ -979,6 +1010,8 @@ DB에 들어간 행만 검사하면 롤백된 실패 정책은 보이지 않습�
    - [x] 정책 pipeline Windows 예약 실행·재시도·로그 스크립트 구현
    - [x] 현재 운영 PC에 정책 pipeline 매일 04:30 작업 등록
    - [ ] VWorld 지역 동기화 주기 추가
+   - [x] 제한형 웹 pipeline·실패 재개·Windows 예약 실행 구현
+   - [x] 현재 운영 PC에 웹 pipeline 매일 04:30 작업 등록
    - [x] 정책 동기화 실패, 신규 `UNRESOLVED`, 임베딩 실패를 종료 코드·JSON으로 노출
    - [ ] 운영 알림 채널에 상태 점검 종료 코드와 429·예산 오류 연결
 5. **크롤링 데이터 점진 확대**

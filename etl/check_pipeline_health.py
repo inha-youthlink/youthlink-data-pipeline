@@ -19,6 +19,9 @@ DB_DSN = os.getenv(
 PIPELINE_STALE_AFTER_MINUTES = int(
     os.getenv("POLICY_PIPELINE_STALE_AFTER_MINUTES", "180")
 )
+WEB_PIPELINE_STALE_AFTER_MINUTES = int(
+    os.getenv("WEB_PIPELINE_STALE_AFTER_MINUTES", "180")
+)
 
 
 def collect_health(conn: psycopg.Connection[Any]) -> dict[str, Any]:
@@ -45,6 +48,19 @@ def collect_health(conn: psycopg.Connection[Any]) -> dict[str, Any]:
             (PIPELINE_STALE_AFTER_MINUTES,),
         )
         latest_pipeline = cur.fetchone()
+        cur.execute(
+            """
+            SELECT status, started_at, finished_at, current_step, error_message,
+                   status = 'RUNNING'
+                   AND started_at < NOW() - (%s * INTERVAL '1 minute')
+                       AS is_stale
+            FROM web_pipeline_job
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            (WEB_PIPELINE_STALE_AFTER_MINUTES,),
+        )
+        latest_web_pipeline = cur.fetchone()
         cur.execute(
             """
             SELECT
@@ -77,6 +93,9 @@ def collect_health(conn: psycopg.Connection[Any]) -> dict[str, Any]:
     return {
         "latest_policy_sync": dict(latest_sync) if latest_sync else None,
         "latest_pipeline": dict(latest_pipeline) if latest_pipeline else None,
+        "latest_web_pipeline": (
+            dict(latest_web_pipeline) if latest_web_pipeline else None
+        ),
         **{key: int(value) for key, value in counts.items()},
     }
 
@@ -101,6 +120,20 @@ def health_problems(health: dict[str, Any]) -> list[str]:
             problems.append(
                 "latest policy pipeline is stale at "
                 f"{latest_pipeline['current_step']}"
+            )
+    latest_web_pipeline = health.get("latest_web_pipeline")
+    if latest_web_pipeline is not None:
+        if latest_web_pipeline["status"] == "FAILED":
+            problems.append(
+                "latest web pipeline failed at "
+                f"{latest_web_pipeline['current_step']}"
+            )
+        elif latest_web_pipeline["status"] == "RUNNING" and (
+            latest_web_pipeline.get("is_stale", False)
+        ):
+            problems.append(
+                "latest web pipeline is stale at "
+                f"{latest_web_pipeline['current_step']}"
             )
     for key in (
         "unresolved_regions",

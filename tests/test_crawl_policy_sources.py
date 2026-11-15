@@ -881,12 +881,15 @@ class CrawlCliTests(unittest.TestCase):
                 second,
                 "--retry-failed",
                 "--refetch",
+                "--per-host-limit",
+                "2",
             ]
         )
 
         self.assertEqual(args.source_id, [UUID(first), UUID(second)])
         self.assertTrue(args.retry_failed)
         self.assertTrue(args.refetch)
+        self.assertEqual(args.per_host_limit, 2)
 
 
 class RecordingWriteCursor:

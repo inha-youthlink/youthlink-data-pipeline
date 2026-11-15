@@ -9,7 +9,7 @@
 - **한 행의 의미**는 해당 테이블의 튜플(row) 하나가 무엇을 나타내는지 설명합니다.
 - `PK`는 기본키, `FK`는 외래키, `UNIQUE`는 중복 방지 제약조건입니다.
 - 외부 API 코드에는 의도적으로 FK를 강제하지 않은 경우가 있습니다. 신규·과거 코드 때문에 정책 수집 전체가 실패하지 않게 하기 위함입니다.
-- 최종 프로젝트 구조는 25개 테이블과 6개 조회용 View입니다. 과거 pgvector 설치 확인용 `vector_test`는 제거했습니다.
+- 최종 프로젝트 구조는 27개 테이블과 6개 조회용 View입니다. 과거 pgvector 설치 확인용 `vector_test`는 제거했습니다.
 
 ## 전체 구성
 
@@ -19,6 +19,8 @@
 | 운영 | `schema_migration` | canonical migration 체크섬·적용 이력 |
 | 운영 | `policy_pipeline_job` | 통합 정책 pipeline 실행·실패 재개 이력 |
 | 운영 | `policy_pipeline_step` | 통합 작업의 단계별 상태·출력 tail |
+| 운영 | `web_pipeline_job` | 제한형 크롤링 pipeline 실행·실패 재개 이력 |
+| 운영 | `web_pipeline_step` | 웹 작업의 단계별 상태·출력 tail |
 | 정책 | `policy` | 온통청년 정책 본문과 정형 조건 |
 | 정책 | `policy_application_period` | 정책별 정확한 단일·복수 신청 기간 |
 | 정책 | `policy_region` | 정책과 온통청년 원본 지역코드 연결 |
@@ -80,6 +82,8 @@
 `schema_migration`은 canonical migration 파일명, SHA-256, 적용 시각과 실행 시간을 저장합니다. `apply_migrations.py`는 중복 번호가 있는 과거 chat 파일을 replay하지 않고 015 수렴 migration을 포함한 명시적 순서를 사용하며, 기록된 파일의 체크섬이 달라지면 실행을 중단합니다.
 
 `policy_pipeline_job`은 정책 동기화부터 최종 검증까지의 통합 실행 하나를 나타냅니다. `status`, `current_step`, `resumed_from_job_id`, 시작·종료 시각, 오류와 JSON 요약을 저장합니다. `policy_pipeline_step`은 `POLICY_SYNC`, `POLICY_CHUNKS`, `POLICY_EMBEDDINGS`, `RAG_PUBLISH`, `VERIFY` 각 단계의 순서·상태·종료 코드·출력 tail을 저장합니다. PostgreSQL advisory lock은 동시에 두 통합 작업이 실행되는 것을 막습니다.
+
+`web_pipeline_job`은 URL 동기화부터 제한 수집, 결정적 재검증, AI shadow·안전 적용, 웹 청크·임베딩, 통합 검색 발행과 검증까지의 실행 하나를 나타냅니다. 실행 당시 `crawl_limit`, `per_host_limit`, `ai_review_limit`과 실패 재개 관계를 저장합니다. `web_pipeline_step`은 9개 단계의 상태·종료 코드·출력 tail을 저장하며 별도 advisory lock으로 웹 작업의 중복 실행을 막습니다.
 
 ---
 

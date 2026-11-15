@@ -896,6 +896,7 @@ def load_candidates(
     limit: int,
     retry_failed: bool,
     refetch: bool = False,
+    per_host_limit: int | None = None,
 ) -> list[CrawlCandidate]:
     statuses = ["DISCOVERED"]
     if retry_failed:
@@ -912,34 +913,48 @@ def load_candidates(
     if source_ids:
         source_filter = "AND source.source_id = ANY(%s)"
         params.append(list(source_ids))
-    params.append(limit)
+    params.extend([per_host_limit, per_host_limit, limit])
 
     sql = f"""
-        SELECT
-            source.source_id,
-            source.canonical_url,
-            source.host,
-            source.etag,
-            source.http_last_modified,
-            MAX(
-                (p.application_method IS NULL)::INTEGER
-              + (p.screening_method IS NULL)::INTEGER
-              + (p.submission_documents IS NULL)::INTEGER
-              + (p.participation_exclusion IS NULL)::INTEGER
-              + (p.additional_qualification IS NULL)::INTEGER
-            )::INTEGER AS priority_score
-        FROM web_source AS source
-        JOIN policy_web_source AS link
-          ON link.source_id = source.source_id
-         AND link.is_active = TRUE
-        JOIN policy AS p
-          ON p.policy_no = link.policy_no
-         AND p.is_active = TRUE
-        WHERE source.fetch_status = ANY(%s)
-          {host_filter}
-          {source_filter}
-        GROUP BY source.source_id
-        ORDER BY priority_score DESC, source.host, source.source_id
+        WITH candidates AS (
+            SELECT
+                source.source_id,
+                source.canonical_url,
+                source.host,
+                source.etag,
+                source.http_last_modified,
+                MAX(
+                    (p.application_method IS NULL)::INTEGER
+                  + (p.screening_method IS NULL)::INTEGER
+                  + (p.submission_documents IS NULL)::INTEGER
+                  + (p.participation_exclusion IS NULL)::INTEGER
+                  + (p.additional_qualification IS NULL)::INTEGER
+                )::INTEGER AS priority_score
+            FROM web_source AS source
+            JOIN policy_web_source AS link
+              ON link.source_id = source.source_id
+             AND link.is_active = TRUE
+            JOIN policy AS p
+              ON p.policy_no = link.policy_no
+             AND p.is_active = TRUE
+            WHERE source.fetch_status = ANY(%s)
+              {host_filter}
+              {source_filter}
+            GROUP BY source.source_id
+        ), ranked AS (
+            SELECT candidates.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY candidates.host
+                       ORDER BY candidates.priority_score DESC,
+                                candidates.source_id
+                   ) AS host_rank
+            FROM candidates
+        )
+        SELECT source_id, canonical_url, host, etag, http_last_modified,
+               priority_score
+        FROM ranked
+        WHERE %s::INTEGER IS NULL OR host_rank <= %s
+        ORDER BY priority_score DESC, host_rank, host, source_id
         LIMIT %s
     """
     with conn.cursor(row_factory=dict_row) as cur:
@@ -1416,9 +1431,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_REQUEST_DELAY_SECONDS,
         help="seconds between source requests (default from env, normally 2)",
     )
+    parser.add_argument(
+        "--per-host-limit",
+        type=int,
+        default=0,
+        help=(
+            "maximum sources selected per exact host; 0 disables the cap "
+            "(default: 0)"
+        ),
+    )
     args = parser.parse_args(argv)
     validate_positive(args.limit, "limit")
     validate_non_negative(args.request_delay, "request delay")
+    validate_non_negative(args.per_host_limit, "per-host limit")
     if not DEFAULT_USER_AGENT:
         parser.error("YOUTHLINK_CRAWLER_USER_AGENT must not be blank")
     return args
@@ -1437,6 +1462,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             limit=args.limit,
             retry_failed=args.retry_failed,
             refetch=args.refetch,
+            per_host_limit=args.per_host_limit or None,
         )
         print(f"crawl plan: sources={len(candidates)}")
         for candidate in candidates:
