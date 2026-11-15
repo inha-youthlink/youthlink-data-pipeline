@@ -13,6 +13,7 @@ from psycopg.rows import dict_row
 
 try:
     from .embedding_utils import (
+        DEFAULT_EMBEDDING_BATCH_SIZE,
         DEFAULT_EMBEDDING_DIMENSIONS,
         DEFAULT_EMBEDDING_ENCODING_FORMAT,
         DEFAULT_EMBEDDING_MODEL,
@@ -25,6 +26,7 @@ try:
     )
 except ImportError:  # Direct execution: python etl/embed_policy_chunks.py
     from embedding_utils import (
+        DEFAULT_EMBEDDING_BATCH_SIZE,
         DEFAULT_EMBEDDING_DIMENSIONS,
         DEFAULT_EMBEDDING_ENCODING_FORMAT,
         DEFAULT_EMBEDDING_MODEL,
@@ -218,8 +220,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=100,
-        help="inputs per API request (default: 100)",
+        default=DEFAULT_EMBEDDING_BATCH_SIZE,
+        help=(
+            "inputs per API request "
+            f"(default: {DEFAULT_EMBEDDING_BATCH_SIZE})"
+        ),
     )
     parser.add_argument(
         "--max-attempts",

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from etl.backfill_embedding_token_estimates import calculate_updates
 from etl.embedding_utils import (
+    DEFAULT_EMBEDDING_BATCH_SIZE,
     DEFAULT_EMBEDDING_DIMENSIONS,
     DEFAULT_EMBEDDING_ENCODING_FORMAT,
     DEFAULT_EMBEDDING_MODEL,
@@ -15,9 +16,14 @@ from etl.embedding_utils import (
     suggested_retry_delay,
     vector_literal,
 )
-from etl.embed_policy_chunks import load_candidates, store_failure
+from etl.embed_policy_chunks import (
+    load_candidates,
+    parse_args as parse_policy_embedding_args,
+    store_failure,
+)
 from etl.embed_policy_web_chunks import (
     load_candidates as load_web_candidates,
+    parse_args as parse_web_embedding_args,
     store_failure as store_web_failure,
 )
 from etl.search_policy_chunks import search_chunks
@@ -66,6 +72,21 @@ class EmbeddingUtilsTests(unittest.TestCase):
         self.assertEqual(DEFAULT_EMBEDDING_MODEL, "bedrock-titan-embed-v2")
         self.assertEqual(DEFAULT_EMBEDDING_DIMENSIONS, 1024)
         self.assertEqual(DEFAULT_EMBEDDING_ENCODING_FORMAT, "float")
+        self.assertEqual(DEFAULT_EMBEDDING_BATCH_SIZE, 32)
+
+    def test_policy_and_web_embedding_default_batch_size_is_32(self):
+        self.assertEqual(parse_policy_embedding_args([]).batch_size, 32)
+        self.assertEqual(parse_web_embedding_args([]).batch_size, 32)
+
+    def test_embedding_batch_size_can_be_overridden(self):
+        self.assertEqual(
+            parse_policy_embedding_args(["--batch-size", "16"]).batch_size,
+            16,
+        )
+        self.assertEqual(
+            parse_web_embedding_args(["--batch-size", "16"]).batch_size,
+            16,
+        )
 
     def test_gateway_client_rejects_missing_or_relative_base_url(self):
         with self.assertRaisesRegex(ValueError, "API key"):

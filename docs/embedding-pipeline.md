@@ -83,14 +83,14 @@ python etl/embed_policy_chunks.py --write
 python etl/embed_policy_chunks.py --write --workers 3
 ```
 
-기본 배치 크기는 100개입니다. 게이트웨이는 입력 배열을 지원합니다. 일시적인 연결 오류, 시간 초과, rate limit, 서버 오류는 최대 8회까지 재시도합니다. API가 응답한 재시도 대기 시간이 있으면 이를 우선하고, 없으면 지수 백오프를 적용합니다. 예산 초과처럼 대기해도 해결되지 않는 오류는 재시도하지 않습니다. 최종 실패한 배치는 `embedding_error`에 오류를 기록하고 다음 배치로 진행합니다.
+정책 청크와 웹 청크의 기본 배치 크기는 모두 32개입니다. 즉, `--batch-size`를 생략하면 임베딩 API 요청 하나에 최대 32개 입력을 묶습니다. 게이트웨이는 입력 배열을 지원합니다. 일시적인 연결 오류, 시간 초과, rate limit, 서버 오류는 최대 8회까지 재시도합니다. API가 응답한 재시도 대기 시간이 있으면 이를 우선하고, 없으면 지수 백오프를 적용합니다. 예산 초과처럼 대기해도 해결되지 않는 오류는 재시도하지 않습니다. 최종 실패한 배치는 `embedding_error`에 오류를 기록하고 다음 배치로 진행합니다.
 
 ```bash
 # 이전 실패 청크 재시도
 python etl/embed_policy_chunks.py --write --retry-errors
 
-# 배치 크기 조정
-python etl/embed_policy_chunks.py --write --batch-size 50
+# 필요할 때 기본값 32를 다른 값으로 조정
+python etl/embed_policy_chunks.py --write --batch-size 16
 ```
 
 이미 같은 모델로 임베딩된 청크는 건너뜁니다. `--force`는 정상 벡터까지 다시 생성하여 API 비용이 다시 발생하므로 모델 변경이나 명시적인 전체 재생성에만 사용합니다.

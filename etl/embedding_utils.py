@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 DEFAULT_EMBEDDING_MODEL = "bedrock-titan-embed-v2"
 DEFAULT_EMBEDDING_DIMENSIONS = 1024
 DEFAULT_EMBEDDING_ENCODING_FORMAT = "float"
+DEFAULT_EMBEDDING_BATCH_SIZE = 32
 _RETRY_SECONDS_RE = re.compile(
     r"try again in\s+([0-9]+(?:\.[0-9]+)?)\s*(ms|s)",
     re.IGNORECASE,
