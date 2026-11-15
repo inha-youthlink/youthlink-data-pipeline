@@ -6,6 +6,7 @@ from etl.verify_ai_evidence import (
     REJECTED,
     REVIEW_REQUIRED,
     VERIFIED,
+    legacy_policy_evidence_hash,
     policy_evidence_hash,
     policy_evidence_payload,
     verify_ai_evidence,
@@ -111,6 +112,7 @@ class VerifyAiEvidenceTests(unittest.TestCase):
 
         self.assertEqual(result.proposed_status, REVIEW_REQUIRED)
         self.assertIn("quote_not_found", {item["reason"] for item in result.rejected_evidence})
+        self.assertIn("unverified_model_evidence", result.blockers)
 
     def test_any_extra_unverified_model_evidence_blocks_approval(self):
         payload = self.payload()
@@ -483,6 +485,186 @@ class VerifyAiEvidenceTests(unittest.TestCase):
         self.assertEqual(result.proposed_status, REVIEW_REQUIRED)
         self.assertEqual(result.conflicting_evidence[0]["category"], "ORGANIZATION")
 
+    def test_shortened_administrative_org_is_reclassified_as_support(self):
+        policy = self.policy(
+            organization_names=(
+                "인천광역시 남동구 정책기획국 일자리정책과",
+            )
+        )
+        payload = self.payload(
+            supporting_evidence=[
+                {
+                    "category": "APPLICATION_PERIOD",
+                    "value": "2026-01-01 ~ 2026-12-31",
+                    "quote": "신청기간 2026-01-01 ~ 2026-12-31",
+                }
+            ],
+            conflicts=[
+                {
+                    "category": "ORGANIZATION",
+                    "value": "인천광역시 남동구 일자리정책과",
+                    "quote": "담당 인천광역시 남동구 일자리정책과",
+                }
+            ],
+        )
+        page = self.page(
+            text=(
+                self.page().text
+                + "\n담당 인천광역시 남동구 일자리정책과"
+            )
+        )
+
+        result = self.verify(payload, policy=policy, page=page)
+
+        self.assertEqual(result.proposed_status, VERIFIED)
+        self.assertFalse(result.conflicting_evidence)
+        self.assertIn(
+            "ORGANIZATION",
+            {item["category"] for item in result.supporting_evidence},
+        )
+
+    def test_shortened_org_does_not_cross_local_scope(self):
+        policy = self.policy(
+            organization_names=("인천광역시 서구 일자리정책과",)
+        )
+        payload = self.payload(
+            conflicts=[
+                {
+                    "category": "ORGANIZATION",
+                    "value": "인천광역시 서해구 일자리정책과",
+                    "quote": "담당 인천광역시 서해구 일자리정책과",
+                }
+            ]
+        )
+        page = self.page(
+            text=self.page().text + "\n담당 인천광역시 서해구 일자리정책과"
+        )
+
+        result = self.verify(payload, policy=policy, page=page)
+
+        self.assertEqual(result.proposed_status, REVIEW_REQUIRED)
+        self.assertIn("conflicting_evidence", result.blockers)
+
+    def test_shortened_org_does_not_cross_metropolitan_scope(self):
+        policy = self.policy(
+            organization_names=("인천광역시 미래산업국 반도체바이오과",)
+        )
+        payload = self.payload(
+            conflicts=[
+                {
+                    "category": "ORGANIZATION",
+                    "value": "부산광역시 반도체바이오과",
+                    "quote": "담당 부산광역시 반도체바이오과",
+                }
+            ]
+        )
+        page = self.page(
+            text=self.page().text + "\n담당 부산광역시 반도체바이오과"
+        )
+
+        result = self.verify(payload, policy=policy, page=page)
+
+        self.assertEqual(result.proposed_status, REVIEW_REQUIRED)
+        self.assertIn("conflicting_evidence", result.blockers)
+
+    def test_long_api_fact_copied_in_one_page_line_adds_code_support(self):
+        policy = self.policy(
+            support_content="청년에게 면접 준비 비용을 최대 오십만원까지 지원",
+        )
+        payload = self.payload(
+            supporting_evidence=[
+                {
+                    "category": "ORGANIZATION",
+                    "value": "인천청년센터",
+                    "quote": "주관기관 인천청년센터",
+                }
+            ]
+        )
+        page = self.page(
+            text=(
+                self.page().text
+                + "\n지원내용 청년에게 면접 준비 비용을 최대 오십만원까지 지원"
+            )
+        )
+
+        result = self.verify(payload, policy=policy, page=page)
+
+        self.assertEqual(result.proposed_status, VERIFIED)
+        code_support = [
+            item for item in result.supporting_evidence
+            if item["kind"] == "CODE_SUPPORT"
+        ]
+        self.assertEqual(code_support[0]["category"], "SUPPORT_CONTENT")
+        self.assertIn(code_support[0]["quote"], page.text)
+
+    def test_short_api_text_is_not_independent_code_support(self):
+        policy = self.policy(support_content="면접비 지원")
+        payload = self.payload(supporting_evidence=[self.payload()["supporting_evidence"][0]])
+
+        result = self.verify(payload, policy=policy)
+
+        self.assertEqual(result.proposed_status, REVIEW_REQUIRED)
+
+    def test_same_api_fragment_in_two_fields_counts_once(self):
+        fact = "청년에게 면접 준비 비용을 최대 오십만원까지 지원"
+        policy = self.policy(description=fact, support_content=fact)
+        payload = self.payload(supporting_evidence=[])
+        page = self.page(text=self.page().text + "\n" + fact)
+
+        result = self.verify(payload, policy=policy, page=page)
+
+        self.assertEqual(result.proposed_status, REVIEW_REQUIRED)
+        self.assertEqual(
+            len(
+                [
+                    item for item in result.supporting_evidence
+                    if item["kind"] == "CODE_SUPPORT"
+                ]
+            ),
+            1,
+        )
+
+    def test_contained_api_fragments_count_once(self):
+        description = "청년에게 면접 준비 비용을 최대 오십만원까지 지원"
+        support = "면접 준비 비용을 최대 오십만원까지 지원"
+        policy = self.policy(
+            description=description,
+            support_content=support,
+        )
+        payload = self.payload(supporting_evidence=[])
+        page = self.page(text=self.page().text + "\n" + description)
+
+        result = self.verify(payload, policy=policy, page=page)
+
+        self.assertEqual(result.proposed_status, REVIEW_REQUIRED)
+        self.assertEqual(
+            len(
+                [
+                    item for item in result.supporting_evidence
+                    if item["kind"] == "CODE_SUPPORT"
+                ]
+            ),
+            1,
+        )
+
+    def test_api_fragment_split_across_page_lines_is_not_counted(self):
+        fact = "청년에게 면접 준비 비용을 최대 오십만원까지 지원"
+        policy = self.policy(support_content=fact)
+        payload = self.payload(supporting_evidence=[])
+        page = self.page(
+            text=self.page().text + "\n청년에게 면접 준비 비용을\n최대 오십만원까지 지원"
+        )
+
+        result = self.verify(payload, policy=policy, page=page)
+
+        self.assertEqual(result.proposed_status, REVIEW_REQUIRED)
+        self.assertFalse(
+            [
+                item for item in result.supporting_evidence
+                if item["kind"] == "CODE_SUPPORT"
+            ]
+        )
+
     def test_policy_evidence_hash_is_stable_and_changes_with_context(self):
         first = self.policy()
         same = self.policy()
@@ -491,6 +673,16 @@ class VerifyAiEvidenceTests(unittest.TestCase):
         self.assertEqual(policy_evidence_payload(first), policy_evidence_payload(same))
         self.assertEqual(policy_evidence_hash(first), policy_evidence_hash(same))
         self.assertNotEqual(policy_evidence_hash(first), policy_evidence_hash(changed))
+
+    def test_current_hash_tracks_code_only_corroboration_but_legacy_does_not(self):
+        first = self.policy()
+        changed = self.policy(support_content="청년에게 면접 준비 비용을 지원")
+
+        self.assertNotEqual(policy_evidence_hash(first), policy_evidence_hash(changed))
+        self.assertEqual(
+            legacy_policy_evidence_hash(first),
+            legacy_policy_evidence_hash(changed),
+        )
 
 
 if __name__ == "__main__":

@@ -477,7 +477,7 @@ PK는 `(policy_no, source_id, relation_type)`입니다. 새 연결은 반드시 
 | `policy_no` | `VARCHAR(30)` | 대상 정책, `policy` FK |
 | `source_id`, `document_id` | `UUID` | 대상 출처와 정확한 문서 버전, `web_document` 복합 FK |
 | `content_hash` | `VARCHAR(64)` | 관찰한 문서 제목·heading·본문의 SHA-256 |
-| `policy_evidence_hash` | `VARCHAR(64)` | 모델 입력과 코드 검증에 사용한 API 정책 근거의 SHA-256 |
+| `policy_evidence_hash` | `VARCHAR(64)` | 모델 입력 필드와 코드 직접문장 검증 필드를 합친 API 정책 근거의 SHA-256 |
 | `previous_status` | `VARCHAR(30)` | 관찰 시 관계 상태, 항상 `REVIEW_REQUIRED` |
 | `model` | `VARCHAR(100)` | 사용한 LiteLLM chat 모델 별칭 |
 | `prompt_version`, `reviewer_version` | `VARCHAR(100)` | 근거 추출 prompt와 코드 재검증 규칙 버전 |
@@ -486,7 +486,7 @@ PK는 `(policy_no, source_id, relation_type)`입니다. 새 연결은 반드시 
 | `identity_result` | `VARCHAR(30)` | 정책 정체성의 `EXACT`, `CONFLICT`, `INSUFFICIENT` 판정 |
 | `raw_response` | `JSONB` | 폐쇄형 스키마로 파싱된 모델 응답. 그 자체는 신뢰하지 않음 |
 | `identity_evidence` | `JSONB` | 저장 원문에서 확인된 정책번호·정책명 직접 인용 배열 |
-| `supporting_evidence` | `JSONB` | API 정책값과 일치한 기관·지역·신청기간·고유어 직접 인용 배열 |
+| `supporting_evidence` | `JSONB` | API 정책값과 일치한 기관·지역·신청기간·고유어 및 12자 이상 직접문장 근거 배열 |
 | `conflicting_evidence` | `JSONB` | 저장 원문에서 확인된 충돌 근거 배열 |
 | `lifecycle_flags` | `JSONB` | 종료·마감·대체·과거 모집 표시 근거 배열 |
 | `rejected_evidence` | `JSONB` | 원문 부재·값 불일치 등 코드 검증에서 거부한 모델 근거 배열 |
@@ -497,9 +497,9 @@ PK는 `(policy_no, source_id, relation_type)`입니다. 새 연결은 반드시 
 | `input_token_count`, `output_token_count` | `INTEGER` | 게이트웨이 응답의 실제 사용량 |
 | `created_at` | `TIMESTAMPTZ` | 관찰 저장 시각 |
 | `applied_at` | `TIMESTAMPTZ` | 이 관찰 UUID를 관계 상태에 명시적으로 적용한 시각 |
-| `metadata` | `JSONB` | 관계 유형, 입력 완전성, 입력 문자 수 등 비민감 실행 메타데이터 |
+| `metadata` | `JSONB` | 관계 유형, 입력 완전성, 구조화된 `review_blockers`, 저장 응답 재판정 출처 등 비민감 실행 메타데이터 |
 
-AI는 `policy_web_source`를 직접 갱신하지 않습니다. `--shadow --write`는 이 테이블에 관찰만 저장합니다. 성공 관찰의 캐시 키에는 정책·출처·문서·문서 hash·정책 근거 hash·모델·prompt·검증기 버전이 모두 포함되므로, 문서나 API 정책 근거가 바뀌면 과거 결과를 재사용하지 않습니다. 실패·잘못된 출력 관찰은 감사용으로 남기되 성공 캐시를 막지 않아 다시 시도할 수 있습니다.
+AI는 `policy_web_source`를 직접 갱신하지 않습니다. `--shadow --write`는 이 테이블에 관찰만 저장합니다. 성공 관찰의 캐시 키에는 정책·출처·문서·문서 hash·정책 근거 hash·모델·prompt·검증기 버전이 모두 포함되므로, 문서나 API 정책 근거가 바뀌면 과거 결과를 재사용하지 않습니다. 실패·잘못된 출력 관찰은 감사용으로 남기되 성공 캐시를 막지 않아 다시 시도할 수 있습니다. `--reprocess-stored`는 동일 문서·정책 근거·prompt의 저장된 성공 응답을 현재 코드로만 다시 검증하며, 이때 token count는 0이고 `metadata.gateway_called=false`로 기록됩니다.
 
 `--apply-review-id`의 명시적 적용 단계는 현재 문서와 정책 근거를 잠근 뒤 저장된 `raw_response`를 다시 파싱·검증합니다. 적용 가능한 `VERIFIED` 또는 대상 정책번호가 없고 다른 정책명이 제목·H1·개별 heading에 직접 인용된 제한적 `REJECTED`만 원자적으로 반영하며, `reviewed_by`와 `reviewed_at`은 사람 검수 전용으로 남깁니다. 이후 `revalidate_policy_sources.py`는 적용 관찰의 정책 근거 hash를 현재 값과 비교해 정책 API·지역 해석이 바뀐 판정을 `REVIEW_REQUIRED`로 되돌립니다. 관찰이 적용되어도 웹 청크·임베딩·통합 검색 projection은 별도 ETL에서 갱신합니다.
 

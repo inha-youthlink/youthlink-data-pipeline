@@ -83,6 +83,13 @@ class PolicyEvidence:
     region_names: tuple[str, ...] = field(default_factory=tuple)
     application_periods: tuple[str, ...] = field(default_factory=tuple)
     distinctive_terms: tuple[str, ...] = field(default_factory=tuple)
+    description: str = ""
+    support_content: str = ""
+    application_method: str = ""
+    additional_qualification: str = ""
+    participation_exclusion: str = ""
+    submission_documents: str = ""
+    business_period_etc: str = ""
 
     @classmethod
     def from_mapping(cls, policy: Mapping[str, Any]) -> "PolicyEvidence":
@@ -104,6 +111,21 @@ class PolicyEvidence:
             region_names=_clean_values(regions),
             application_periods=_clean_values(periods),
             distinctive_terms=_clean_values(distinctive_terms),
+            description=str(policy.get("description") or "").strip(),
+            support_content=str(policy.get("support_content") or "").strip(),
+            application_method=str(policy.get("application_method") or "").strip(),
+            additional_qualification=str(
+                policy.get("additional_qualification") or ""
+            ).strip(),
+            participation_exclusion=str(
+                policy.get("participation_exclusion") or ""
+            ).strip(),
+            submission_documents=str(
+                policy.get("submission_documents") or ""
+            ).strip(),
+            business_period_etc=str(
+                policy.get("business_period_etc") or ""
+            ).strip(),
         )
 
 

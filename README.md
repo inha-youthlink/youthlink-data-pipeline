@@ -558,21 +558,28 @@ python etl/revalidate_policy_sources.py --limit 100
 python etl/revalidate_policy_sources.py --limit 100 --write
 ```
 
-이 재검증은 적용된 AI 관찰의 `policy_evidence_hash`도 현재 정책명·기관·지역·신청기간·고유어와 비교합니다. 정책 API나 지역 해석이 이후 바뀐 AI 판정은 자동으로 `REVIEW_REQUIRED`로 되돌리고 새 shadow 검토 대상으로 남깁니다. 현재 결정적 검증기와 AI 코드 검증기 버전이 모두 같고 근거도 변경되지 않은 판정만 보존하며, 이전 AI 코드 버전은 재검증 대상으로 돌립니다.
+이 재검증은 적용된 AI 관찰의 `policy_evidence_hash`도 현재 정책명·기관·지역·신청기간·고유어와 비교합니다. 정책 API나 지역 해석이 이후 바뀐 AI 판정은 자동으로 `REVIEW_REQUIRED`로 되돌리고 새 shadow 검토 대상으로 남깁니다. 현재 버전과 명시적으로 호환되는 이전 AI 코드 검증기 판정만 보존하며, 호환 목록에서 제외된 버전은 결정적 재검증 대상으로 돌립니다.
 
 `REVIEW_REQUIRED`는 먼저 AI 보조 검증을 shadow 모드로 실행할 수 있습니다. 기본 실행은 후보만 출력하며 게이트웨이를 호출하거나 DB를 변경하지 않습니다.
 
 ```bash
 python etl/ai_review_policy_sources.py --limit 10 --show-url
+python etl/ai_review_policy_sources.py --host www.wonju.go.kr --limit 10
 
 # 비용이 발생하는 명시적 shadow 실행: 관찰 행만 저장하고 관계 상태는 유지
 python etl/ai_review_policy_sources.py --shadow --limit 1 --write
 
 # 저장된 관찰 확인
 python etl/ai_review_policy_sources.py --show-observations --limit 20
+
+# 저장된 AI JSON을 현재 코드로만 재판정: 게이트웨이 호출·토큰 비용 없음
+python etl/ai_review_policy_sources.py --reprocess-stored --limit 200
+python etl/ai_review_policy_sources.py --reprocess-stored --limit 200 --write
 ```
 
-AI는 페이지 유형과 직접 인용 근거만 폐쇄형 JSON으로 추출합니다. 코드가 각 인용이 정확한 저장 문서에 실제로 존재하는지, 값이 API 소유 정책 근거와 일치하는지 다시 확인합니다. 정확한 정책 정체성, 서로 독립적인 근거 2종 이상, 충돌·종료 표시·다중 정책·검증 실패 근거 없음이 모두 충족되어야 `VERIFIED`를 제안합니다. 본문이 기본 80,000자 한도를 넘으면 잘라서 판단하지 않고 실패 관찰을 남겨 `REVIEW_REQUIRED`를 유지합니다.
+AI는 페이지 유형과 직접 인용 근거만 폐쇄형 JSON으로 추출합니다. 코드가 각 인용이 정확한 저장 문서에 실제로 존재하는지, 값이 API 소유 정책 근거와 일치하는지 다시 확인합니다. 정확한 정책 정체성, 서로 독립적인 근거 2종 이상, 충돌·종료 표시·다중 정책·검증 실패 근거 없음이 모두 충족되어야 `VERIFIED`를 제안합니다. 행정기관명은 같은 시·도와 최종 부서명이 일치하고, 양쪽에 시·군·구가 있으면 그 범위까지 같은 경우에만 중간 본부·국 생략을 허용합니다. 다른 지역·다른 구·다른 최종 부서는 계속 충돌입니다. API의 설명·지원내용·신청방법·추가자격 등은 정규화 후 12자 이상인 문장이 저장 원문의 한 줄에 직접 포함된 경우에만 코드 보조 근거로 추가하며, 정책명 자체나 같은 문장의 중복 필드는 독립 근거로 세지 않습니다. 본문이 기본 80,000자 한도를 넘으면 잘라서 판단하지 않고 실패 관찰을 남겨 `REVIEW_REQUIRED`를 유지합니다.
+
+`REVIEW_REQUIRED`의 코드 차단 사유는 관찰 `metadata.review_blockers`에 배열로 저장됩니다. `--reprocess-stored`는 이전 성공 관찰의 동일한 `raw_response`를 현재 코드로 다시 검증하므로 새 AI 비용 없이 규칙 개선 효과를 확인할 수 있습니다. 문서 hash·prompt와 모델 입력용 정책 근거가 같아야 하며, 새 관찰에는 코드 보조 근거까지 포함한 현재 정책 근거 hash를 다시 저장합니다.
 
 shadow 결과는 `policy_web_ai_review`에만 기록되며 `policy_web_source`를 바꾸지 않습니다. 적용할 관찰 UUID를 확인한 뒤 먼저 dry-run으로 현재 문서와 제안을 다시 확인하고, 같은 명령에 `--write`를 붙여 정확히 한 관찰만 적용합니다.
 

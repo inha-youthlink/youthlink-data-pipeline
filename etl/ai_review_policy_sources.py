@@ -21,6 +21,7 @@ try:
     from .source_relevance import PageEvidence, PolicyEvidence, VALIDATOR_VERSION
     from .verify_ai_evidence import (
         AI_REVIEWER_VERSION,
+        legacy_policy_evidence_hash,
         policy_evidence_hash,
         policy_evidence_payload,
         verify_ai_evidence,
@@ -31,6 +32,7 @@ except ImportError:  # Direct execution: python etl/ai_review_policy_sources.py
     from source_relevance import PageEvidence, PolicyEvidence, VALIDATOR_VERSION
     from verify_ai_evidence import (
         AI_REVIEWER_VERSION,
+        legacy_policy_evidence_hash,
         policy_evidence_hash,
         policy_evidence_payload,
         verify_ai_evidence,
@@ -186,12 +188,17 @@ def load_ai_review_candidates(
     *,
     limit: int,
     policy_no: str | None = None,
+    host: str | None = None,
 ) -> list[AiReviewCandidate]:
     policy_filter = ""
+    host_filter = ""
     params: list[Any] = []
     if policy_no is not None:
         policy_filter = "AND policy_row.policy_no = %s"
         params.append(policy_no)
+    if host is not None:
+        host_filter = "AND source.host = %s"
+        params.append(host)
     params.append(limit)
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
@@ -223,6 +230,13 @@ def load_ai_review_candidates(
                 COALESCE(policy_row.keywords, '{{}}'::TEXT[])
                   || COALESCE(policy_row.middle_categories, '{{}}'::TEXT[])
                     AS distinctive_terms,
+                policy_row.description,
+                policy_row.support_content,
+                policy_row.application_method,
+                policy_row.additional_qualification,
+                policy_row.participation_exclusion,
+                policy_row.submission_documents,
+                policy_row.business_period_etc,
                 source.source_id,
                 source.host,
                 COALESCE(source.final_url, source.canonical_url) AS source_url,
@@ -248,6 +262,7 @@ def load_ai_review_candidates(
               AND link.validation_status = 'REVIEW_REQUIRED'
               AND link.reviewed_at IS NULL
               {policy_filter}
+              {host_filter}
             GROUP BY policy_row.policy_no, source.source_id, document.document_id
             ORDER BY source.host, policy_row.policy_no
             LIMIT %s
@@ -337,6 +352,11 @@ def store_observation(
         "relation_types": list(candidate.relation_types),
         **dict(metadata or {}),
     }
+    if verified:
+        observation_metadata["review_blockers"] = list(
+            verified.get("blockers", [])
+        )
+        observation_metadata["verification_reason"] = verified.get("reason")
     conflict_clause = ""
     if execution_status == "SUCCEEDED":
         conflict_clause = """
@@ -490,6 +510,104 @@ def shadow_review_candidate(
     return review_id, verification.proposed_status, False
 
 
+def load_reprocessable_observation(
+    conn: psycopg.Connection[Any],
+    *,
+    candidate: AiReviewCandidate,
+    model: str | None = None,
+) -> dict[str, Any] | None:
+    """Load stored model evidence for local code-only re-verification."""
+    model_filter = ""
+    params: list[Any] = [
+        candidate.policy.policy_no,
+        candidate.source_id,
+        candidate.document_id,
+        candidate.content_hash,
+        [
+            policy_evidence_hash(candidate.policy),
+            legacy_policy_evidence_hash(candidate.policy),
+        ],
+        PROMPT_VERSION,
+    ]
+    if model is not None:
+        model_filter = "AND model = %s"
+        params.append(model)
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            f"""
+            SELECT *
+            FROM policy_web_ai_review
+            WHERE policy_no = %s
+              AND source_id = %s
+              AND document_id = %s
+              AND content_hash = %s
+              AND policy_evidence_hash = ANY(%s)
+              AND prompt_version = %s
+              AND execution_status = 'SUCCEEDED'
+              AND raw_response IS NOT NULL
+              {model_filter}
+            ORDER BY
+                (
+                    reviewer_version = %s
+                    AND policy_evidence_hash = %s
+                ) DESC,
+                created_at DESC,
+                ai_review_id DESC
+            LIMIT 1
+            """,
+            tuple(
+                [
+                    *params,
+                    AI_REVIEWER_VERSION,
+                    policy_evidence_hash(candidate.policy),
+                ]
+            ),
+        )
+        return cur.fetchone()
+
+
+def reprocess_stored_candidate(
+    conn: psycopg.Connection[Any],
+    *,
+    candidate: AiReviewCandidate,
+    model: str | None = None,
+    write: bool,
+) -> tuple[Any | None, str, bool]:
+    """Re-run code verification over saved AI JSON without a gateway call."""
+    stored = load_reprocessable_observation(
+        conn,
+        candidate=candidate,
+        model=model,
+    )
+    if stored is None:
+        return None, "NO_STORED_OBSERVATION", False
+
+    evidence = parse_ai_evidence(stored["raw_response"])
+    verification = verify_ai_evidence(candidate.policy, candidate.page, evidence)
+    if stored["reviewer_version"] == AI_REVIEWER_VERSION:
+        return stored["ai_review_id"], verification.proposed_status, True
+    if not write:
+        return stored["ai_review_id"], verification.proposed_status, False
+
+    review_id = store_observation(
+        conn,
+        candidate=candidate,
+        model=stored["model"],
+        execution_status="SUCCEEDED",
+        raw_response=stored["raw_response"],
+        verification=verification,
+        input_tokens=0,
+        output_tokens=0,
+        metadata={
+            "input_complete": True,
+            "gateway_called": False,
+            "reprocessed_from_ai_review_id": str(stored["ai_review_id"]),
+            "reprocessed_from_reviewer_version": stored["reviewer_version"],
+        },
+    )
+    return review_id, verification.proposed_status, False
+
+
 def load_observations(
     conn: psycopg.Connection[Any],
     *,
@@ -574,7 +692,14 @@ def _load_locked_policy(
                 ) AS application_periods,
                 COALESCE(policy_row.keywords, '{}'::TEXT[])
                   || COALESCE(policy_row.middle_categories, '{}'::TEXT[])
-                    AS distinctive_terms
+                    AS distinctive_terms,
+                policy_row.description,
+                policy_row.support_content,
+                policy_row.application_method,
+                policy_row.additional_qualification,
+                policy_row.participation_exclusion,
+                policy_row.submission_documents,
+                policy_row.business_period_etc
             FROM policy AS policy_row
             WHERE policy_row.policy_no = %s
               AND policy_row.is_active = TRUE
@@ -905,8 +1030,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=UUID,
         help="apply one code-verified observation; requires --write to mutate",
     )
+    action.add_argument(
+        "--reprocess-stored",
+        action="store_true",
+        help=(
+            "re-run current code verification over stored successful AI JSON; "
+            "never calls the gateway"
+        ),
+    )
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--policy-no")
+    parser.add_argument("--host", help="restrict candidates to one exact host")
     parser.add_argument("--model")
     parser.add_argument(
         "--max-page-chars",
@@ -927,8 +1061,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--snippet-chars must be greater than zero")
     if args.max_page_chars <= 0:
         parser.error("--max-page-chars must be greater than zero")
-    if args.write and not (args.shadow or args.apply_review_id):
-        parser.error("--write requires --shadow or --apply-review-id")
+    if args.write and not (
+        args.shadow or args.apply_review_id or args.reprocess_stored
+    ):
+        parser.error(
+            "--write requires --shadow, --reprocess-stored, or --apply-review-id"
+        )
     if args.policy_no is not None:
         args.policy_no = args.policy_no.strip()
         if not args.policy_no or len(args.policy_no) > 30:
@@ -937,6 +1075,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args.model = args.model.strip()
         if not args.model:
             parser.error("--model must not be blank")
+    if args.host is not None:
+        args.host = args.host.strip().casefold().rstrip(".")
+        if not args.host or len(args.host) > 253:
+            parser.error("--host must contain 1 to 253 characters")
     return args
 
 
@@ -993,12 +1135,52 @@ def main(argv: Sequence[str] | None = None) -> int:
             conn,
             limit=args.limit,
             policy_no=args.policy_no,
+            host=args.host,
         )
         print_candidates(
             candidates,
             snippet_chars=args.snippet_chars,
             show_url=args.show_url,
         )
+        if args.reprocess_stored:
+            if args.write:
+                conn.commit()
+            totals: dict[str, int] = {}
+            for candidate in candidates:
+                if args.write:
+                    with conn.transaction():
+                        review_id, proposed_status, cached = (
+                            reprocess_stored_candidate(
+                                conn,
+                                candidate=candidate,
+                                model=args.model,
+                                write=True,
+                            )
+                        )
+                else:
+                    review_id, proposed_status, cached = reprocess_stored_candidate(
+                        conn,
+                        candidate=candidate,
+                        model=args.model,
+                        write=False,
+                    )
+                totals[proposed_status] = totals.get(proposed_status, 0) + 1
+                print(
+                    "stored reprocess: "
+                    f"ai_review_id={review_id}, "
+                    f"policy_no={candidate.policy.policy_no}, "
+                    f"proposed_status={proposed_status}, "
+                    f"cached={str(cached).lower()}"
+                )
+            if not args.write:
+                conn.rollback()
+            summary = ", ".join(
+                f"{status}={count}" for status, count in sorted(totals.items())
+            ) or "no candidates"
+            print(f"stored reprocess complete: {summary}")
+            if not args.write:
+                print("plan only; no gateway request and no database write")
+            return 0
         if not args.shadow or not args.write:
             print("plan only; no gateway request and no database write")
             return 0

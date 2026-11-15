@@ -25,12 +25,72 @@ except ImportError:  # pragma: no cover - direct script/import compatibility
     from source_relevance import PageEvidence, PolicyEvidence, normalize_for_match
 
 
-AI_REVIEWER_VERSION = "ai-evidence-code-v2"
+AI_REVIEWER_VERSION = "ai-evidence-code-v5"
 VERIFIED = "VERIFIED"
 REVIEW_REQUIRED = "REVIEW_REQUIRED"
 REJECTED = "REJECTED"
 
 _WHITESPACE_RE = re.compile(r"\s+")
+_ORGANIZATION_TOKEN_RE = re.compile(r"[0-9A-Za-z가-힣]+")
+_DIRECT_TEXT_SPLIT_RE = re.compile(r"[\r\n.;•·]+")
+_MIN_DIRECT_TEXT_CHARACTERS = 12
+_MAX_DIRECT_TEXT_QUOTE_CHARACTERS = 1000
+_DIRECT_TEXT_SUPPORT_FIELDS = (
+    ("DESCRIPTION", "description"),
+    ("SUPPORT_CONTENT", "support_content"),
+    ("APPLICATION_METHOD", "application_method"),
+    ("ADDITIONAL_QUALIFICATION", "additional_qualification"),
+    ("PARTICIPATION_EXCLUSION", "participation_exclusion"),
+    ("SUBMISSION_DOCUMENTS", "submission_documents"),
+    ("BUSINESS_PERIOD", "business_period_etc"),
+)
+_TOP_LEVEL_SCOPE_ALIASES = {
+    "서울": "서울",
+    "서울시": "서울",
+    "서울특별시": "서울",
+    "부산": "부산",
+    "부산시": "부산",
+    "부산광역시": "부산",
+    "대구": "대구",
+    "대구시": "대구",
+    "대구광역시": "대구",
+    "인천": "인천",
+    "인천시": "인천",
+    "인천광역시": "인천",
+    "광주": "광주",
+    "광주시": "광주",
+    "광주광역시": "광주",
+    "대전": "대전",
+    "대전시": "대전",
+    "대전광역시": "대전",
+    "울산": "울산",
+    "울산시": "울산",
+    "울산광역시": "울산",
+    "세종": "세종",
+    "세종시": "세종",
+    "세종특별자치시": "세종",
+    "경기": "경기",
+    "경기도": "경기",
+    "강원": "강원",
+    "강원도": "강원",
+    "강원특별자치도": "강원",
+    "충북": "충북",
+    "충청북도": "충북",
+    "충남": "충남",
+    "충청남도": "충남",
+    "전북": "전북",
+    "전라북도": "전북",
+    "전북특별자치도": "전북",
+    "전남": "전남",
+    "전라남도": "전남",
+    "경북": "경북",
+    "경상북도": "경북",
+    "경남": "경남",
+    "경상남도": "경남",
+    "제주": "제주",
+    "제주도": "제주",
+    "제주특별자치도": "제주",
+}
 
 
 def policy_evidence_payload(
@@ -52,7 +112,32 @@ def policy_evidence_payload(
 def policy_evidence_hash(
     policy: PolicyEvidence | Mapping[str, Any],
 ) -> str:
-    """Fingerprint policy context so a cached observation cannot hide drift."""
+    """Fingerprint all policy context used by the current code verifier."""
+    if not isinstance(policy, PolicyEvidence):
+        policy = PolicyEvidence.from_mapping(policy)
+    payload = {
+        **policy_evidence_payload(policy),
+        "description": policy.description,
+        "support_content": policy.support_content,
+        "application_method": policy.application_method,
+        "additional_qualification": policy.additional_qualification,
+        "participation_exclusion": policy.participation_exclusion,
+        "submission_documents": policy.submission_documents,
+        "business_period_etc": policy.business_period_etc,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def legacy_policy_evidence_hash(
+    policy: PolicyEvidence | Mapping[str, Any],
+) -> str:
+    """Return the v2/v3 hash that covered only model-visible policy context."""
     encoded = json.dumps(
         policy_evidence_payload(policy),
         ensure_ascii=False,
@@ -73,6 +158,7 @@ class EvidenceVerification:
     conflicting_evidence: tuple[dict[str, str], ...] = field(default_factory=tuple)
     lifecycle_flags: tuple[dict[str, str], ...] = field(default_factory=tuple)
     rejected_evidence: tuple[dict[str, str], ...] = field(default_factory=tuple)
+    blockers: tuple[str, ...] = field(default_factory=tuple)
     verification_result: str = "INSUFFICIENT"
     reason: str = ""
     reviewer_version: str = AI_REVIEWER_VERSION
@@ -164,11 +250,159 @@ def _matches_one_exact(value: str, expected: Sequence[str]) -> bool:
     return any(_same_value(value, item) for item in expected)
 
 
+def _organization_tokens(value: str) -> tuple[str, ...]:
+    return tuple(
+        token
+        for token in (
+            _compact_match(item) for item in _ORGANIZATION_TOKEN_RE.findall(value)
+        )
+        if token
+    )
+
+
+def _top_level_scopes(tokens: Sequence[str]) -> set[str]:
+    return {
+        canonical
+        for token in tokens
+        if (canonical := _TOP_LEVEL_SCOPE_ALIASES.get(token)) is not None
+    }
+
+
+def _local_scopes(tokens: Sequence[str]) -> set[str]:
+    return {
+        token
+        for token in tokens
+        if token not in _TOP_LEVEL_SCOPE_ALIASES
+        and len(token) >= 2
+        and token.endswith(("시", "군", "구"))
+    }
+
+
+def _same_organization_hierarchy(left: str, right: str) -> bool:
+    """Match only a safely shortened administrative organization name.
+
+    Intermediate bureau/division labels may be omitted, but both names must
+    share a metropolitan/provincial scope and the exact terminal organization
+    unit. When both names state a local city/county/district, that scope must
+    also match. This deliberately does not guess university/company aliases.
+    """
+    if _same_value(left, right):
+        return True
+
+    left_tokens = _organization_tokens(left)
+    right_tokens = _organization_tokens(right)
+    if not left_tokens or not right_tokens:
+        return False
+
+    left_top = _top_level_scopes(left_tokens)
+    right_top = _top_level_scopes(right_tokens)
+    if not left_top or not right_top or not left_top.intersection(right_top):
+        return False
+
+    left_terminal = left_tokens[-1]
+    right_terminal = right_tokens[-1]
+    if left_terminal != right_terminal:
+        left_terminal_scope = _TOP_LEVEL_SCOPE_ALIASES.get(left_terminal)
+        right_terminal_scope = _TOP_LEVEL_SCOPE_ALIASES.get(right_terminal)
+        if (
+            left_terminal_scope is None
+            or right_terminal_scope is None
+            or left_terminal_scope != right_terminal_scope
+        ):
+            return False
+
+    left_local = _local_scopes(left_tokens[:-1])
+    right_local = _local_scopes(right_tokens[:-1])
+    if left_local and right_local and not left_local.intersection(right_local):
+        return False
+    return True
+
+
+def _direct_text_fragments(value: str, *, policy_name: str) -> tuple[str, ...]:
+    normalized_policy_name = _compact_match(policy_name)
+    result: list[str] = []
+    for raw_fragment in _DIRECT_TEXT_SPLIT_RE.split(value or ""):
+        fragment = _WHITESPACE_RE.sub(" ", raw_fragment).strip(" -–—:()[]")
+        normalized = _compact_match(fragment)
+        if len(normalized) < _MIN_DIRECT_TEXT_CHARACTERS:
+            continue
+        # A policy name is identity evidence, not an independent policy fact.
+        if normalized_policy_name and (
+            normalized == normalized_policy_name
+            or (
+                normalized_policy_name in normalized
+                and len(normalized) <= len(normalized_policy_name) + 6
+            )
+        ):
+            continue
+        result.append(fragment)
+    return tuple(result)
+
+
+def _discover_direct_text_support(
+    policy: PolicyEvidence,
+    combined_page: str,
+) -> tuple[dict[str, str], ...]:
+    """Find long API-owned facts copied directly into the stored page.
+
+    This supplements, but never replaces, the AI-extracted page type and
+    identity. A fact counts only when a normalized API fragment of at least
+    12 characters occurs within one exact stored page line. The returned
+    quote is copied from that line for auditability.
+    """
+    page_lines = tuple(
+        line
+        for line in (
+            _WHITESPACE_RE.sub(" ", raw_line).strip()
+            for raw_line in combined_page.splitlines()
+        )
+        if line and len(line) <= _MAX_DIRECT_TEXT_QUOTE_CHARACTERS
+    )
+    normalized_lines = tuple((_compact_match(line), line) for line in page_lines)
+    result: list[dict[str, str]] = []
+    seen_fragments: set[str] = set()
+    for category, attribute in _DIRECT_TEXT_SUPPORT_FIELDS:
+        for fragment in _direct_text_fragments(
+            getattr(policy, attribute),
+            policy_name=policy.policy_name,
+        ):
+            normalized_fragment = _compact_match(fragment)
+            if any(
+                normalized_fragment in seen
+                or seen in normalized_fragment
+                for seen in seen_fragments
+            ):
+                continue
+            matched_quote = next(
+                (
+                    line
+                    for normalized_line, line in normalized_lines
+                    if normalized_fragment in normalized_line
+                ),
+                None,
+            )
+            if matched_quote is None:
+                continue
+            result.append(
+                {
+                    "category": category,
+                    "value": fragment,
+                    "quote": matched_quote,
+                    "kind": "CODE_SUPPORT",
+                }
+            )
+            seen_fragments.add(normalized_fragment)
+            break
+    return tuple(result)
+
+
 def _matches_support_value(
     value: str,
     expected: Sequence[str],
     category: str,
 ) -> bool:
+    if category == "ORGANIZATION":
+        return any(_same_organization_hierarchy(value, item) for item in expected)
     if category != "REGION":
         return _matches_one_exact(value, expected)
 
@@ -358,6 +592,13 @@ def verify_ai_evidence(
             )
             continue
         expected_values = _expected_conflict_values(policy, item.category)
+        if item.category == "ORGANIZATION" and _matches_support_value(
+            item.value,
+            expected_values,
+            item.category,
+        ):
+            supporting_evidence.append(_evidence_dict(item, kind="SUPPORT"))
+            continue
         if not expected_values or _matches_one_exact(item.value, expected_values):
             rejected_evidence.append(
                 _rejected(item, kind="CONFLICT", reason="not_a_conflict")
@@ -380,6 +621,10 @@ def verify_ai_evidence(
             )
             continue
         lifecycle_flags.append(_evidence_dict(item, kind="LIFECYCLE"))
+
+    supporting_evidence.extend(
+        _discover_direct_text_support(policy, combined_page)
+    )
 
     identity_evidence_tuple = _deduplicate(identity_evidence)
     supporting_evidence_tuple = _deduplicate(supporting_evidence)
@@ -515,6 +760,7 @@ def verify_ai_evidence(
         conflicting_evidence=conflicting_evidence_tuple,
         lifecycle_flags=lifecycle_flags_tuple,
         rejected_evidence=rejected_evidence_tuple,
+        blockers=tuple(blockers),
         verification_result="INSUFFICIENT",
         reason="Automatic decision blocked: " + ", ".join(blockers),
     )

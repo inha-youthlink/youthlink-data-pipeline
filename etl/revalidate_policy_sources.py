@@ -20,7 +20,11 @@ try:
         PolicyEvidence,
         VALIDATOR_VERSION,
     )
-    from .verify_ai_evidence import AI_REVIEWER_VERSION, policy_evidence_hash
+    from .verify_ai_evidence import (
+        AI_REVIEWER_VERSION,
+        legacy_policy_evidence_hash,
+        policy_evidence_hash,
+    )
 except ImportError:  # Direct execution: python etl/revalidate_policy_sources.py
     from crawl_policy_sources import (
         ExtractedPage,
@@ -32,7 +36,11 @@ except ImportError:  # Direct execution: python etl/revalidate_policy_sources.py
         PolicyEvidence,
         VALIDATOR_VERSION,
     )
-    from verify_ai_evidence import AI_REVIEWER_VERSION, policy_evidence_hash
+    from verify_ai_evidence import (
+        AI_REVIEWER_VERSION,
+        legacy_policy_evidence_hash,
+        policy_evidence_hash,
+    )
 
 
 load_dotenv()
@@ -43,6 +51,14 @@ DB_DSN = os.getenv(
     "postgresql://postgres:postgres@localhost:5432/youthlink",
 )
 CURRENT_AI_VALIDATOR_VERSION = f"{VALIDATOR_VERSION}+{AI_REVIEWER_VERSION}"
+LEGACY_AI_VALIDATOR_VERSIONS = (
+    f"{VALIDATOR_VERSION}+ai-evidence-code-v4",
+    f"{VALIDATOR_VERSION}+ai-evidence-code-v3",
+    f"{VALIDATOR_VERSION}+ai-evidence-code-v2",
+)
+COMPATIBLE_AI_VALIDATOR_VERSIONS = tuple(
+    dict.fromkeys((CURRENT_AI_VALIDATOR_VERSION, *LEGACY_AI_VALIDATOR_VERSIONS))
+)
 STALE_AI_VALIDATOR_VERSION = f"{VALIDATOR_VERSION}+ai-evidence-stale-v1"
 
 
@@ -68,6 +84,17 @@ class StaleAiReviewTarget:
     proposed_status: str
     observed_policy_evidence_hash: str
     current_policy_evidence_hash: str
+    validator_version: str
+    reviewer_version: str
+
+
+def policy_evidence_hash_for_reviewer(
+    policy: PolicyEvidence,
+    reviewer_version: str,
+) -> str:
+    if reviewer_version in {"ai-evidence-code-v2", "ai-evidence-code-v3"}:
+        return legacy_policy_evidence_hash(policy)
+    return policy_evidence_hash(policy)
 
 
 def extracted_page_from_candidate(
@@ -116,6 +143,8 @@ def load_stale_ai_review_targets(
                 review.content_hash,
                 review.proposed_status,
                 review.policy_evidence_hash AS observed_policy_evidence_hash,
+                review.reviewer_version,
+                link.validator_version,
                 policy_row.policy_name,
                 ARRAY_REMOVE(ARRAY[
                     policy_row.supervising_org_name,
@@ -140,7 +169,14 @@ def load_stale_ai_review_targets(
                 ) AS application_periods,
                 COALESCE(policy_row.keywords, '{}'::TEXT[])
                   || COALESCE(policy_row.middle_categories, '{}'::TEXT[])
-                    AS distinctive_terms
+                    AS distinctive_terms,
+                policy_row.description,
+                policy_row.support_content,
+                policy_row.application_method,
+                policy_row.additional_qualification,
+                policy_row.participation_exclusion,
+                policy_row.submission_documents,
+                policy_row.business_period_etc
             FROM policy_web_ai_review AS review
             JOIN policy_web_source AS link
               ON link.policy_no = review.policy_no
@@ -149,7 +185,8 @@ def load_stale_ai_review_targets(
              AND link.is_active = TRUE
              AND link.reviewed_at IS NULL
              AND link.validation_status = review.proposed_status
-             AND link.validator_version = %s
+             AND link.validator_version = ANY(%s)
+             AND link.validator_version = %s || review.reviewer_version
             JOIN policy AS policy_row
               ON policy_row.policy_no = review.policy_no
              AND policy_row.is_active = TRUE
@@ -169,13 +206,19 @@ def load_stale_ai_review_targets(
                 review.applied_at DESC,
                 review.ai_review_id DESC
             """,
-            (CURRENT_AI_VALIDATOR_VERSION,),
+            (
+                list(COMPATIBLE_AI_VALIDATOR_VERSIONS),
+                f"{VALIDATOR_VERSION}+",
+            ),
         )
         rows = list(cur.fetchall())
 
     stale: list[StaleAiReviewTarget] = []
     for row in rows:
-        current_hash = policy_evidence_hash(PolicyEvidence.from_mapping(row))
+        current_hash = policy_evidence_hash_for_reviewer(
+            PolicyEvidence.from_mapping(row),
+            row["reviewer_version"],
+        )
         if current_hash == row["observed_policy_evidence_hash"]:
             continue
         stale.append(
@@ -190,6 +233,8 @@ def load_stale_ai_review_targets(
                     "observed_policy_evidence_hash"
                 ],
                 current_policy_evidence_hash=current_hash,
+                validator_version=row["validator_version"],
+                reviewer_version=row["reviewer_version"],
             )
         )
         if len(stale) >= limit:
@@ -231,7 +276,14 @@ def _load_locked_policy_evidence(
                 ) AS application_periods,
                 COALESCE(policy_row.keywords, '{}'::TEXT[])
                   || COALESCE(policy_row.middle_categories, '{}'::TEXT[])
-                    AS distinctive_terms
+                    AS distinctive_terms,
+                policy_row.description,
+                policy_row.support_content,
+                policy_row.application_method,
+                policy_row.additional_qualification,
+                policy_row.participation_exclusion,
+                policy_row.submission_documents,
+                policy_row.business_period_etc
             FROM policy AS policy_row
             WHERE policy_row.policy_no = %s
               AND policy_row.is_active = TRUE
@@ -252,7 +304,10 @@ def invalidate_stale_ai_review(
 ) -> int:
     """Demote one stale applied AI decision without touching human review."""
     policy = _load_locked_policy_evidence(conn, policy_no=target.policy_no)
-    current_hash = policy_evidence_hash(policy)
+    current_hash = policy_evidence_hash_for_reviewer(
+        policy,
+        target.reviewer_version,
+    )
     if current_hash == target.observed_policy_evidence_hash:
         return 0
 
@@ -301,7 +356,7 @@ def invalidate_stale_ai_review(
         if any(
             link["validation_status"] != target.proposed_status
             or str(link["validated_document_id"]) != str(target.document_id)
-            or link["validator_version"] != CURRENT_AI_VALIDATOR_VERSION
+            or link["validator_version"] != target.validator_version
             for link in links
         ):
             return 0
@@ -333,7 +388,7 @@ def invalidate_stale_ai_review(
                 target.source_id,
                 target.proposed_status,
                 target.document_id,
-                CURRENT_AI_VALIDATOR_VERSION,
+                target.validator_version,
             ),
         )
         updated = {row["relation_type"] for row in cur.fetchall()}
@@ -374,7 +429,7 @@ def load_revalidation_candidates(
              AND policy_row.is_active = TRUE
             WHERE link.validation_status = 'PENDING'
                OR link.validator_version IS NULL
-               OR link.validator_version NOT IN (%s, %s, %s, %s)
+               OR link.validator_version NOT IN (%s, %s, %s, %s, %s, %s, %s)
                OR link.validated_document_id IS DISTINCT FROM document.document_id
                OR (
                     link.validator_version IS DISTINCT FROM %s
@@ -403,6 +458,7 @@ def load_revalidation_candidates(
             (
                 VALIDATOR_VERSION,
                 CURRENT_AI_VALIDATOR_VERSION,
+                *LEGACY_AI_VALIDATOR_VERSIONS,
                 STALE_AI_VALIDATOR_VERSION,
                 SAME_NAME_VERSION_GUARD_VERSION,
                 SAME_NAME_VERSION_GUARD_VERSION,

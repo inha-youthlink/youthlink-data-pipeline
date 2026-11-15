@@ -5,7 +5,9 @@ import unittest
 from contextlib import redirect_stderr
 
 from etl.revalidate_policy_sources import (
+    COMPATIBLE_AI_VALIDATOR_VERSIONS,
     CURRENT_AI_VALIDATOR_VERSION,
+    LEGACY_AI_VALIDATOR_VERSIONS,
     RevalidationCandidate,
     STALE_AI_VALIDATOR_VERSION,
     StaleAiReviewTarget,
@@ -20,7 +22,7 @@ from etl.source_relevance import (
     PolicyEvidence,
     VALIDATOR_VERSION,
 )
-from etl.verify_ai_evidence import policy_evidence_hash
+from etl.verify_ai_evidence import legacy_policy_evidence_hash, policy_evidence_hash
 
 
 class RecordingCursor:
@@ -86,7 +88,10 @@ class RevalidationSelectionTests(unittest.TestCase):
         sql, params = conn.recording_cursor.executions[0]
         self.assertIn("link.validation_status = 'PENDING'", sql)
         self.assertIn("link.validator_version IS NULL", sql)
-        self.assertIn("link.validator_version NOT IN (%s, %s, %s, %s)", sql)
+        self.assertIn(
+            "link.validator_version NOT IN (%s, %s, %s, %s, %s, %s, %s)",
+            sql,
+        )
         self.assertIn("sibling_policy.policy_name", sql)
         self.assertIn(
             "link.validated_document_id IS DISTINCT FROM document.document_id",
@@ -98,6 +103,7 @@ class RevalidationSelectionTests(unittest.TestCase):
             (
                 VALIDATOR_VERSION,
                 CURRENT_AI_VALIDATOR_VERSION,
+                *LEGACY_AI_VALIDATOR_VERSIONS,
                 STALE_AI_VALIDATOR_VERSION,
                 SAME_NAME_VERSION_GUARD_VERSION,
                 SAME_NAME_VERSION_GUARD_VERSION,
@@ -108,8 +114,10 @@ class RevalidationSelectionTests(unittest.TestCase):
     def test_current_base_ai_versions_are_not_selected_as_stale(self) -> None:
         self.assertEqual(
             CURRENT_AI_VALIDATOR_VERSION,
-            f"{VALIDATOR_VERSION}+ai-evidence-code-v2",
+            f"{VALIDATOR_VERSION}+ai-evidence-code-v5",
         )
+        for version in LEGACY_AI_VALIDATOR_VERSIONS:
+            self.assertIn(version, COMPATIBLE_AI_VALIDATOR_VERSIONS)
 
     def test_applied_ai_drift_is_filtered_by_current_policy_hash(self) -> None:
         policy = PolicyEvidence(
@@ -131,11 +139,13 @@ class RevalidationSelectionTests(unittest.TestCase):
             "region_names": list(policy.region_names),
             "application_periods": list(policy.application_periods),
             "distinctive_terms": list(policy.distinctive_terms),
+            "validator_version": LEGACY_AI_VALIDATOR_VERSIONS[0],
+            "reviewer_version": "ai-evidence-code-v3",
         }
         unchanged = {
             **common,
             "ai_review_id": "review-unchanged",
-            "observed_policy_evidence_hash": policy_evidence_hash(policy),
+            "observed_policy_evidence_hash": legacy_policy_evidence_hash(policy),
         }
         stale = {
             **common,
@@ -151,8 +161,18 @@ class RevalidationSelectionTests(unittest.TestCase):
         self.assertEqual([target.ai_review_id for target in targets], ["review-stale"])
         sql, params = conn.recording_cursor.executions[0]
         self.assertIn("review.applied_at IS NOT NULL", sql)
-        self.assertIn("link.validator_version = %s", sql)
-        self.assertEqual(params, (CURRENT_AI_VALIDATOR_VERSION,))
+        self.assertIn("link.validator_version = ANY(%s)", sql)
+        self.assertIn(
+            "link.validator_version = %s || review.reviewer_version",
+            sql,
+        )
+        self.assertEqual(
+            params,
+            (
+                list(COMPATIBLE_AI_VALIDATOR_VERSIONS),
+                f"{VALIDATOR_VERSION}+",
+            ),
+        )
 
     def test_stale_ai_invalidation_updates_all_locked_relation_types(self) -> None:
         policy_row = {
@@ -172,13 +192,15 @@ class RevalidationSelectionTests(unittest.TestCase):
             proposed_status="VERIFIED",
             observed_policy_evidence_hash="0" * 64,
             current_policy_evidence_hash="1" * 64,
+            validator_version=LEGACY_AI_VALIDATOR_VERSIONS[-1],
+            reviewer_version="ai-evidence-code-v2",
         )
         links = [
             {
                 "relation_type": "REFERENCE_1",
                 "validation_status": "VERIFIED",
                 "validated_document_id": "document-1",
-                "validator_version": f"{VALIDATOR_VERSION}+ai-evidence-code-v2",
+                "validator_version": LEGACY_AI_VALIDATOR_VERSIONS[-1],
                 "reviewed_at": None,
             }
         ]

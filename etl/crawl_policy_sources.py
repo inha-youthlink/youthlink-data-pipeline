@@ -980,7 +980,14 @@ def load_policy_evidence(
                 ) AS application_periods,
                 COALESCE(p.keywords, '{}'::TEXT[])
                   || COALESCE(p.middle_categories, '{}'::TEXT[])
-                    AS distinctive_terms
+                    AS distinctive_terms,
+                p.description,
+                p.support_content,
+                p.application_method,
+                p.additional_qualification,
+                p.participation_exclusion,
+                p.submission_documents,
+                p.business_period_etc
             FROM policy_web_source AS link
             JOIN policy AS p
               ON p.policy_no = link.policy_no
