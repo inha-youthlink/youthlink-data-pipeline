@@ -74,6 +74,9 @@ youthlink-data-pipeline/
 │   ├── check_pipeline_health.py # 운영 실패·미해결 지역·임베딩 상태 점검
 │   └── logs/                  # 실행 중 생성, Git 제외
 │       └── failed_policies.jsonl
+├── ops/
+│   ├── run_policy_pipeline.ps1 # 예약 실행·상태 점검·로컬 로그
+│   └── register_policy_pipeline_task.ps1 # Windows 작업 스케줄러 등록
 ├── tests/                       # 네트워크·DB 없이 실행되는 단위 테스트
 ├── .github/workflows/tests.yml # Python 3.10~3.12 단위 테스트 + pgvector 스키마 CI
 ├── sample_response.json       # 로컬 적재 테스트용 응답
@@ -475,7 +478,7 @@ API 모드는 **페이지 단위 트랜잭션 안에 정책별 SAVEPOINT**를 �
 - 페이지 사이에는 기본 1초를 기다립니다. 온통청년은 공개 문서에 정확한 호출 제한을 명시하지 않으므로 403을 임의로 무한 재시도하지 말고, 작업을 `FAILED`로 보존한 뒤 원인을 확인합니다.
 - DB 연결 장애, 페이지 커밋 실패, 로그 파일 쓰기 실패도 계속 진행을 보장하지 않습니다.
 - API 응답에 `result.youthPolicyList`가 없거나 타입이 잘못되면 빈 마지막 페이지로 오인하지 않고 실행을 중단합니다. 다만 공급자가 별도 업무 오류 코드를 추가하면 그 코드의 성공·실패 규칙은 추가 검토해야 합니다.
-- 종료 요약의 `success`는 신규 삽입과 기존 갱신을 합한 처리 건수이며 DB 전체 행 수와 다를 수 있습니다. 처리 실패 건이 있어도 현재 CLI는 별도의 실패 종료 코드를 설정하지 않습니다.
+- 종료 요약의 `success`는 신규 삽입과 기존 갱신을 합한 처리 건수이며 DB 전체 행 수와 다를 수 있습니다. 완전한 전체 수집만 종료 코드 0을 반환하며 `PARTIAL` 또는 `FAILED`는 비정상 종료 코드로 상위 pipeline과 스케줄러에 전달됩니다.
 
 ## 10. UPSERT와 주기 동기화 전략
 
@@ -492,13 +495,7 @@ API 모드는 **페이지 단위 트랜잭션 안에 정책별 SAVEPOINT**를 �
 
 빈 응답, 일부 정책 실패, 총건수 변화, 중복 정책 번호, 네트워크 중단이 있으면 작업은 `PARTIAL` 또는 `FAILED`가 되고 비활성화는 수행하지 않습니다. 이후 API에 다시 나타난 정책은 자동으로 활성화됩니다.
 
-현재는 CLI를 수동 재실행하는 구조이며, 스케줄러는 구현되지 않았습니다. 다음 운영 단계는 다음과 같습니다.
-
-1. API 호출 한도와 필요한 최신성을 기준으로 동기화 주기를 정합니다.
-2. 작업 스케줄러 또는 CI에서 실행하고 동시 중복 실행을 막습니다.
-3. `policy_sync_job`의 실패·부분 성공을 모니터링하고 알립니다.
-4. 반복 페이지 감지와 공급자별 호출 한도 설정을 보완합니다.
-5. 정책 변경 시 관련 청크·임베딩을 갱신하는 흐름을 연결합니다.
+정책 API 동기화는 통합 pipeline을 통해 청크·임베딩·검색 projection까지 연결됩니다. Windows 개발·운영 PC에서는 `ops/register_policy_pipeline_task.ps1`로 예약 작업을 등록할 수 있고, 서버 환경에서는 같은 Python 진입점을 cron이나 CI에서 실행할 수 있습니다. PostgreSQL advisory lock이 동시 실행을 막으며 최근 실패는 실패 단계부터 재개됩니다.
 
 API에서 사라진 정책과 기존 청크·임베딩은 이력 확인을 위해 보존합니다. 청크 생성, 임베딩 후보 선택, Vector Search는 기본적으로 `is_active = true` 정책만 사용합니다.
 
@@ -721,12 +718,37 @@ python etl/run_policy_pipeline.py --workers 3
 # 실패 단계부터 새 작업으로 재개
 python etl/run_policy_pipeline.py --resume-job-id 실패한_UUID --workers 3
 
+# 최근 6시간 이내 실패가 있으면 실패 단계부터, 없으면 전체 실행
+python etl/run_policy_pipeline.py --resume-latest-failed --workers 3
+
 # 스케줄러·알림 시스템이 사용할 상태 점검(비정상이면 exit 1)
 python etl/check_pipeline_health.py
 python etl/check_pipeline_health.py --json
 ```
 
-Windows 작업 스케줄러, cron, CI 등 배포 환경의 스케줄러는 `run_policy_pipeline.py`의 종료 코드와 `check_pipeline_health.py --json` 결과를 사용합니다. 비밀값은 명령 인자로 넘기지 않고 `.env` 또는 배포 환경의 secret store로 주입합니다.
+Windows에서는 아래 명령으로 기본 매일 04:30 예약 작업을 등록합니다. 등록 스크립트는 현재 로그인한 사용자로 실행하며 PC가 꺼져 있었으면 다음 사용 가능 시 시작하고, 실패하면 15분 간격으로 최대 2회 재시도합니다. 실제 실행은 최근 실패가 6시간 이내면 그 단계부터 재개합니다.
+
+```powershell
+# 등록 내용을 실제로 바꾸지 않고 확인
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File ops/register_policy_pipeline_task.ps1 -WhatIf
+
+# 기본 04:30 등록
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File ops/register_policy_pipeline_task.ps1
+
+# 원하는 시간으로 등록 또는 갱신
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File ops/register_policy_pipeline_task.ps1 -DailyAt "05:00"
+
+# 즉시 1회 실행
+Start-ScheduledTask -TaskName "YouthLink-Policy-Pipeline"
+
+# 등록 해제
+Unregister-ScheduledTask -TaskName "YouthLink-Policy-Pipeline" -Confirm:$false
+```
+
+실행 로그는 Git에서 제외된 `etl/logs/policy-pipeline/`에 30일 동안 보관됩니다. 작업이 성공해도 `check_pipeline_health.py --json`이 비정상 상태를 발견하면 Windows 작업 결과는 실패로 남습니다. 비밀값은 명령 인자로 넘기지 않고 `.env` 또는 배포 환경의 secret store로 주입합니다. 임베딩 단계는 신규·변경·오류 청크만 게이트웨이를 호출하며 나머지 단계는 AI 토큰을 사용하지 않습니다.
 
 두 원천의 임베딩이 적재된 뒤 통합 검색 projection을 계획하고 발행합니다. 이 단계는 기존 벡터를 DB 내부에서 복사하므로 게이트웨이 비용이 들지 않습니다.
 
@@ -954,7 +976,9 @@ DB에 들어간 행만 검사하면 롤백된 실패 정책은 보이지 않습�
    - [x] 정책 전체 동기화 → 변경 청크 생성 → 변경분 임베딩 → 발행·검증을 하나의 작업으로 연결
    - [x] 동시 실행 advisory lock, 단계별 이력, 실패 단계 재개와 오류 요약 추가
 4. **스케줄링과 모니터링**
-   - [ ] 배포 환경의 작업 스케줄러에 정책 pipeline·VWorld 지역 동기화 주기 등록
+   - [x] 정책 pipeline Windows 예약 실행·재시도·로그 스크립트 구현
+   - [x] 현재 운영 PC에 정책 pipeline 매일 04:30 작업 등록
+   - [ ] VWorld 지역 동기화 주기 추가
    - [x] 정책 동기화 실패, 신규 `UNRESOLVED`, 임베딩 실패를 종료 코드·JSON으로 노출
    - [ ] 운영 알림 채널에 상태 점검 종료 코드와 429·예산 오류 연결
 5. **크롤링 데이터 점진 확대**

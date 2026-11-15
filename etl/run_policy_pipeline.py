@@ -20,6 +20,10 @@ DB_DSN = os.getenv(
     "DATABASE_URL",
     "postgresql://postgres:postgres@localhost:5432/youthlink",
 )
+DEFAULT_WORKERS = int(os.getenv("POLICY_PIPELINE_WORKERS", "3"))
+DEFAULT_RESUME_MAX_AGE_HOURS = float(
+    os.getenv("POLICY_PIPELINE_RESUME_MAX_AGE_HOURS", "6")
+)
 LOCK_NAME = "youthlink:policy-pipeline"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STEP_NAMES = (
@@ -180,6 +184,59 @@ def load_resume_step(conn: psycopg.Connection[Any], job_id: str) -> str:
     return str(row[1])
 
 
+def fail_orphaned_jobs(conn: psycopg.Connection[Any]) -> list[str]:
+    """Close RUNNING rows left behind after a terminated process.
+
+    This function must only run while this process owns the pipeline advisory
+    lock. A live pipeline would still own that lock, so any remaining RUNNING
+    row is an orphaned audit record rather than an active job.
+    """
+    message = "pipeline process ended before recording completion"
+    conn.execute(
+        """
+        UPDATE policy_pipeline_step AS step
+        SET status = 'FAILED', finished_at = NOW(), exit_code = -1,
+            output_tail = %s
+        FROM policy_pipeline_job AS job
+        WHERE step.pipeline_job_id = job.pipeline_job_id
+          AND job.status = 'RUNNING'
+          AND step.status = 'RUNNING'
+        """,
+        (message,),
+    )
+    rows = conn.execute(
+        """
+        UPDATE policy_pipeline_job
+        SET status = 'FAILED', finished_at = NOW(), error_message = %s
+        WHERE status = 'RUNNING'
+        RETURNING pipeline_job_id
+        """,
+        (message,),
+    ).fetchall()
+    conn.commit()
+    return [str(row[0]) for row in rows]
+
+
+def load_latest_failed_job(
+    conn: psycopg.Connection[Any],
+    max_age_hours: float,
+) -> tuple[str, str] | None:
+    """Return the latest failed job only when it is recent enough to resume."""
+    row = conn.execute(
+        """
+        SELECT pipeline_job_id, status, current_step,
+               started_at >= NOW() - (%s * INTERVAL '1 hour') AS is_recent
+        FROM policy_pipeline_job
+        ORDER BY started_at DESC
+        LIMIT 1
+        """,
+        (max_age_hours,),
+    ).fetchone()
+    if row is None or row[1] != "FAILED" or not row[3]:
+        return None
+    return str(row[0]), str(row[2])
+
+
 def run_pipeline(
     conn: psycopg.Connection[Any],
     *,
@@ -307,15 +364,33 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "RAG publish, and invariant verification under one advisory lock."
         )
     )
-    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     parser.add_argument("--start-at", choices=STEP_NAMES, default="POLICY_SYNC")
     parser.add_argument("--resume-job-id")
+    parser.add_argument(
+        "--resume-latest-failed",
+        action="store_true",
+        help="resume the latest recent failed job, otherwise start a full run",
+    )
+    parser.add_argument(
+        "--resume-max-age-hours",
+        type=float,
+        default=DEFAULT_RESUME_MAX_AGE_HOURS,
+    )
     parser.add_argument("--plan", action="store_true")
     args = parser.parse_args(argv)
     if args.workers <= 0:
         parser.error("--workers must be greater than zero")
-    if args.resume_job_id and args.start_at != "POLICY_SYNC":
-        parser.error("--resume-job-id cannot be combined with --start-at")
+    if args.resume_max_age_hours <= 0:
+        parser.error("--resume-max-age-hours must be greater than zero")
+    if args.resume_job_id and args.resume_latest_failed:
+        parser.error(
+            "--resume-job-id cannot be combined with --resume-latest-failed"
+        )
+    if (args.resume_job_id or args.resume_latest_failed) and (
+        args.start_at != "POLICY_SYNC"
+    ):
+        parser.error("resume options cannot be combined with --start-at")
     return args
 
 
@@ -330,14 +405,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     with psycopg.connect(DB_DSN) as conn:
         acquire_lock(conn)
         try:
+            orphaned_job_ids = fail_orphaned_jobs(conn)
+            if orphaned_job_ids:
+                print(
+                    "closed orphaned pipeline jobs: "
+                    + ", ".join(orphaned_job_ids),
+                    flush=True,
+                )
             start_at = args.start_at
+            resumed_from_job_id: str | None = None
             if args.resume_job_id:
                 start_at = load_resume_step(conn, args.resume_job_id)
+                resumed_from_job_id = args.resume_job_id
+            elif args.resume_latest_failed:
+                latest_failed = load_latest_failed_job(
+                    conn,
+                    args.resume_max_age_hours,
+                )
+                if latest_failed is not None:
+                    resumed_from_job_id, start_at = latest_failed
+                    print(
+                        f"resuming recent failed job {resumed_from_job_id} "
+                        f"from {start_at}",
+                        flush=True,
+                    )
             job_id = run_pipeline(
                 conn,
                 start_at=start_at,
                 workers=args.workers,
-                resumed_from_job_id=args.resume_job_id,
+                resumed_from_job_id=resumed_from_job_id,
             )
         finally:
             release_lock(conn)

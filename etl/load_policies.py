@@ -44,6 +44,15 @@ DEFAULT_RETRY_BASE_DELAY_SECONDS = float(
 MAX_RETRY_DELAY_SECONDS = 30.0
 
 
+@dataclass(frozen=True)
+class PolicySyncResult:
+    sync_job_id: UUID
+    status: str
+    success_count: int
+    failed_count: int
+    completion_error: str | None = None
+
+
 # ============================================================
 # Helpers
 # ============================================================
@@ -924,7 +933,7 @@ def deactivate_unseen_policies(
     return cur.rowcount
 
 
-def run_api_etl(page_size: int = DEFAULT_PAGE_SIZE) -> tuple[int, int]:
+def run_api_etl(page_size: int = DEFAULT_PAGE_SIZE) -> PolicySyncResult:
     validate_page_size(page_size)
 
     success_count = 0
@@ -935,6 +944,9 @@ def run_api_etl(page_size: int = DEFAULT_PAGE_SIZE) -> tuple[int, int]:
     totals_consistent = True
     full_scan_completed = False
     successful_policy_nos: set[str] = set()
+
+    completion_error: str | None = None
+    is_complete = False
 
     with psycopg.connect(DB_DSN) as conn:
         sync_job_id = create_sync_job(conn, page_size)
@@ -1068,7 +1080,13 @@ def run_api_etl(page_size: int = DEFAULT_PAGE_SIZE) -> tuple[int, int]:
                 )
             raise
 
-    return success_count, failed_count
+    return PolicySyncResult(
+        sync_job_id=sync_job_id,
+        status="SUCCEEDED" if is_complete else "PARTIAL",
+        success_count=success_count,
+        failed_count=failed_count,
+        completion_error=completion_error,
+    )
 
 
 # ============================================================
@@ -1132,17 +1150,23 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
     if args.command == "api":
-        success_count, failed_count = run_api_etl(args.page_size)
+        result = run_api_etl(args.page_size)
 
         print()
         print("========== ETL RESULT ==========")
-        print(f"success : {success_count}")
-        print(f"failed  : {failed_count}")
-        print(f"total   : {success_count + failed_count}")
+        print(f"status  : {result.status}")
+        print(f"job_id  : {result.sync_job_id}")
+        print(f"success : {result.success_count}")
+        print(f"failed  : {result.failed_count}")
+        print(f"total   : {result.success_count + result.failed_count}")
         print("================================")
 
-        if failed_count > 0:
+        if result.failed_count > 0:
             print(f"failed log: {FAILED_LOG_PATH}")
+        if result.status != "SUCCEEDED":
+            if result.completion_error:
+                print(f"incomplete sync: {result.completion_error}")
+            return 1
     elif args.command == "file":
         run_json_file(args.path)
     elif args.command == "backfill-periods":

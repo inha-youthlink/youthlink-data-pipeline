@@ -16,6 +16,9 @@ DB_DSN = os.getenv(
     "DATABASE_URL",
     "postgresql://postgres:postgres@localhost:5432/youthlink",
 )
+PIPELINE_STALE_AFTER_MINUTES = int(
+    os.getenv("POLICY_PIPELINE_STALE_AFTER_MINUTES", "180")
+)
 
 
 def collect_health(conn: psycopg.Connection[Any]) -> dict[str, Any]:
@@ -31,11 +34,15 @@ def collect_health(conn: psycopg.Connection[Any]) -> dict[str, Any]:
         latest_sync = cur.fetchone()
         cur.execute(
             """
-            SELECT status, started_at, finished_at, current_step, error_message
+            SELECT status, started_at, finished_at, current_step, error_message,
+                   status = 'RUNNING'
+                   AND started_at < NOW() - (%s * INTERVAL '1 minute')
+                       AS is_stale
             FROM policy_pipeline_job
             ORDER BY started_at DESC
             LIMIT 1
-            """
+            """,
+            (PIPELINE_STALE_AFTER_MINUTES,),
         )
         latest_pipeline = cur.fetchone()
         cur.execute(
@@ -82,10 +89,19 @@ def health_problems(health: dict[str, Any]) -> list[str]:
     elif latest_sync["status"] != "SUCCEEDED":
         problems.append(f"latest policy sync status={latest_sync['status']}")
     latest_pipeline = health.get("latest_pipeline")
-    if latest_pipeline is not None and latest_pipeline["status"] == "FAILED":
-        problems.append(
-            f"latest policy pipeline failed at {latest_pipeline['current_step']}"
-        )
+    if latest_pipeline is not None:
+        if latest_pipeline["status"] == "FAILED":
+            problems.append(
+                "latest policy pipeline failed at "
+                f"{latest_pipeline['current_step']}"
+            )
+        elif latest_pipeline["status"] == "RUNNING" and latest_pipeline.get(
+            "is_stale", False
+        ):
+            problems.append(
+                "latest policy pipeline is stale at "
+                f"{latest_pipeline['current_step']}"
+            )
     for key in (
         "unresolved_regions",
         "policy_embedding_errors",

@@ -467,14 +467,37 @@ class CommandLineTests(unittest.TestCase):
         mocked.assert_called_once_with("sample.json")
 
     def test_main_dispatches_api_command(self) -> None:
+        result = load_policies.PolicySyncResult(
+            sync_job_id=uuid4(),
+            status="SUCCEEDED",
+            success_count=3,
+            failed_count=0,
+        )
         with (
-            patch.object(load_policies, "run_api_etl", return_value=(3, 1)) as mocked,
+            patch.object(load_policies, "run_api_etl", return_value=result) as mocked,
             patch("sys.stdout", new=io.StringIO()),
         ):
             exit_code = load_policies.main(["api", "--page-size", "25"])
 
         self.assertEqual(exit_code, 0)
         mocked.assert_called_once_with(25)
+
+    def test_main_returns_nonzero_for_partial_api_sync(self) -> None:
+        result = load_policies.PolicySyncResult(
+            sync_job_id=uuid4(),
+            status="PARTIAL",
+            success_count=3,
+            failed_count=1,
+            completion_error="1 policy failed to load",
+        )
+        with (
+            patch.object(load_policies, "run_api_etl", return_value=result),
+            patch("sys.stdout", new=io.StringIO()) as output,
+        ):
+            exit_code = load_policies.main(["api"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("incomplete sync", output.getvalue())
 
     def test_main_dispatches_period_backfill(self) -> None:
         with (
